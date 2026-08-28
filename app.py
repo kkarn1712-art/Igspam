@@ -5,11 +5,12 @@ import sqlite3
 import random
 import threading
 import json
+import socket
 from flask import Flask, render_template_string, request, session
 from flask_socketio import SocketIO, emit, join_room
 import instagrapi
 from instagrapi import Client
-from instagrapi.exceptions import LoginRequired
+from instagrapi.exceptions import LoginRequired, ClientError, ChallengeRequired
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret_key_pratik_secure_2026'
@@ -18,7 +19,19 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 DB_FILE = 'raid_console_data.db'
 DELAYS = [24, 45, 20, 15, 40]
 
-# --- PROXY REMOVED ---
+# --- DNS CHECK ---
+def check_dns():
+    """Check if we can resolve Instagram's domain"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            socket.gethostbyname('i.instagram.com')
+            print(f"DNS resolved successfully (attempt {attempt + 1})")
+            return True
+        except Exception as e:
+            print(f"DNS attempt {attempt + 1} failed: {e}")
+            time.sleep(3)
+    return False
 
 # --- DATABASE SETUP ---
 def init_db():
@@ -89,45 +102,53 @@ HEADERS = {
     "Connection": "close",
 }
 
-def get_instagram_client(user_key, session_id=None, username=None, password=None):
+def get_instagram_client(user_key, session_id):
+    """Create and validate Instagram client using session ID only"""
     try:
+        # Check DNS first
+        if not check_dns():
+            return None, None, "Network error: Cannot reach Instagram. Please try again in a few minutes."
+        
         cl = Client()
         cl.set_device(DEVICE_SETTINGS)
         cl.set_user_agent(HEADERS["User-Agent"])
         
-        if username and password:
-            cl.login(username, password)
-        elif session_id:
-            cl.login_by_sessionid(session_id)
-        else:
-            return None, None
-            
+        # Try to login with session ID
+        cl.login_by_sessionid(session_id)
+        
+        # Get account info to verify
         user_info = cl.account_info()
         
         if user_info and user_info.pk:
+            # Save session for future use
             session_file = f"session_{user_key}.json"
             cl.dump_settings(session_file)
-            return cl, user_info
-        return None, None
+            return cl, user_info, None
+        return None, None, "Failed to get account information"
+        
+    except ChallengeRequired as e:
+        return None, None, "Instagram requires verification. Please log in via browser first."
+    except LoginRequired as e:
+        return None, None, "Session expired. Please get a fresh session ID."
+    except ClientError as e:
+        if "467" in str(e):
+            return None, None, "Session blocked by Instagram. Get a fresh session ID."
+        elif "400" in str(e):
+            return None, None, "Invalid session ID format. Please check your session ID."
+        else:
+            return None, None, f"Instagram error: {str(e)}"
+    except socket.timeout:
+        return None, None, "Connection timeout. Please try again."
     except Exception as e:
-        print(f"Login error: {e}")
-        return None, None
+        error_msg = str(e).lower()
+        if "proxy" in error_msg:
+            return None, None, "Proxy connection failed. Check network settings."
+        elif "resolve" in error_msg or "dns" in error_msg:
+            return None, None, "DNS resolution failed. The platform may have network restrictions."
+        else:
+            return None, None, f"Login failed: {str(e)}"
 
-def verify_credentials(username, password):
-    try:
-        cl = Client()
-        cl.set_device(DEVICE_SETTINGS)
-        cl.set_user_agent(HEADERS["User-Agent"])
-        cl.login(username, password)
-        user_info = cl.account_info()
-        if user_info and user_info.pk:
-            return True, user_info.username
-        return False, None
-    except Exception as e:
-        print(f"Verification failed: {e}")
-        return False, None
-
-# HTML TEMPLATE
+# HTML TEMPLATE - Session ID only
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -238,16 +259,8 @@ HTML_TEMPLATE = """
             <h2 class="panel-title">CONTROL PANEL</h2>
             <div class="form-group">
                 <div class="input-group">
-                    <label for="username">INSTAGRAM USERNAME</label>
-                    <input type="text" id="username" placeholder="Enter your Instagram username">
-                </div>
-                <div class="input-group">
-                    <label for="password">PASSWORD</label>
-                    <input type="password" id="password" placeholder="Enter your password">
-                </div>
-                <div class="input-group">
-                    <label for="sessionId">SESSION ID (Optional)</label>
-                    <input type="text" id="sessionId" placeholder="Or use Session ID instead">
+                    <label for="sessionId">SESSION ID</label>
+                    <input type="text" id="sessionId" placeholder="Enter Instagram Session ID">
                 </div>
                 <div class="button-group">
                     <button class="btn btn-login" onclick="login()">LOGIN</button>
@@ -291,14 +304,12 @@ HTML_TEMPLATE = """
         let storedPages = JSON.parse(localStorage.getItem('pratik_pages') || '[]');
         let activePageId = localStorage.getItem('pratik_active_page');
         
-        // Generate a UNIQUE user key for this browser session
         let userKey = localStorage.getItem('pratik_user_key');
         if (!userKey) {
             userKey = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
             localStorage.setItem('pratik_user_key', userKey);
         }
         
-        // Use the page ID from the tab system
         let currentPageId = activePageId || ('Page_' + Date.now());
         
         if (storedPages.length === 0) {
@@ -313,7 +324,6 @@ HTML_TEMPLATE = """
             renderStoredPagesList();
         }
 
-        // Register this page with the server using BOTH userKey and pageId
         socket.on('connect', function() {
             socket.emit('register_page', { 
                 page_id: currentPageId,
@@ -408,12 +418,10 @@ HTML_TEMPLATE = """
             document.getElementById('pagesDrawer').classList.toggle('open');
         }
 
-        // --- SOCKET EVENTS ---
         socket.on('init_state', function(data) {
             if (data.page_id && data.page_id !== currentPageId) return;
             if (data.user_key && data.user_key !== userKey) return;
             
-            document.getElementById('username').value = data.username !== 'NOT LOGGED IN' ? '' : '';
             document.getElementById('sessionId').value = data.session_id || '';
             document.getElementById('threadId').value = data.thread_id || '';
             if (data.message) document.getElementById('message').value = data.message;
@@ -468,25 +476,15 @@ HTML_TEMPLATE = """
         }
 
         function login() {
-            const username = document.getElementById('username').value.trim();
-            const password = document.getElementById('password').value.trim();
             const sid = document.getElementById('sessionId').value.trim();
-            
-            if (username && password) {
-                socket.emit('login', { 
-                    username: username,
-                    password: password,
-                    page_id: currentPageId,
-                    user_key: userKey 
-                });
-            } else if (sid) {
+            if (sid) {
                 socket.emit('login', { 
                     session_id: sid, 
                     page_id: currentPageId,
                     user_key: userKey 
                 });
             } else {
-                alert('Please enter either username/password OR session ID');
+                alert('Please enter your Session ID');
             }
         }
 
@@ -526,6 +524,10 @@ HTML_TEMPLATE = """
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+@app.route('/health')
+def health():
+    return "OK", 200
 
 # Store page-specific data
 page_data = {}
@@ -634,51 +636,43 @@ def handle_login(data):
     user_key = data.get('user_key')
     page_id = data.get('page_id')
     session_id = data.get('session_id')
-    username = data.get('username')
-    password = data.get('password')
     page_key = f"{user_key}_{page_id}"
     
-    # Check if we have login credentials
-    if not session_id and not (username and password):
-        msg = "Please enter session ID OR username and password"
+    if not session_id:
+        msg = "Please enter a session ID"
         save_log(page_key, msg, 'error')
         emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
         return
     
     try:
-        cl = Client()
-        cl.set_device(DEVICE_SETTINGS)
-        cl.set_user_agent(HEADERS["User-Agent"])
+        # Try to get Instagram client with session ID
+        cl, user_info, error_msg = get_instagram_client(page_key, session_id)
         
-        # Try username/password first (more reliable on Render)
-        if username and password:
-            cl.login(username, password)
-        elif session_id:
-            cl.login_by_sessionid(session_id)
-        else:
-            raise Exception("No valid login method provided")
+        if error_msg:
+            save_log(page_key, error_msg, 'error')
+            emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
+            emit('console_message', {'message': error_msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+            return
         
-        user_info = cl.account_info()
-        
-        if not user_info or not user_info.pk:
-            raise Exception("Failed to get account info")
+        if not cl or not user_info:
+            msg = "Failed to create Instagram client. Please try again."
+            save_log(page_key, msg, 'error')
+            emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
+            emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+            return
         
         # Login successful
         active_clients[page_key] = cl
         
-        # Save session for future use
-        session_file = f"session_{page_key}.json"
-        cl.dump_settings(session_file)
-        
         if page_key in page_data:
-            page_data[page_key]['session_id'] = session_id or 'session_saved'
+            page_data[page_key]['session_id'] = session_id
             page_data[page_key]['username'] = user_info.username
         
         conn = get_db_connection()
         conn.execute('''
             INSERT INTO user_raids (user_key, session_id, username) VALUES (?, ?, ?)
             ON CONFLICT(user_key) DO UPDATE SET session_id=?, username=?
-        ''', (page_key, session_id or 'session_saved', user_info.username, session_id or 'session_saved', user_info.username))
+        ''', (page_key, session_id, user_info.username, session_id, user_info.username))
         conn.commit()
         conn.close()
         
@@ -689,10 +683,8 @@ def handle_login(data):
         
     except Exception as e:
         error_msg = str(e)
-        if "login" in error_msg.lower() or "password" in error_msg.lower() or "username" in error_msg.lower():
-            msg = f"LOGIN FAILED: Invalid username or password. Please check your credentials."
-        elif "session" in error_msg.lower():
-            msg = f"LOGIN FAILED: Invalid or expired session ID. Please get a new one."
+        if "login" in error_msg.lower():
+            msg = "LOGIN FAILED: Invalid session ID. Please get a fresh one."
         else:
             msg = f"LOGIN FAILED: {error_msg}"
         save_log(page_key, msg, 'error')
@@ -786,11 +778,11 @@ def run_raid(page_key, target_thread, target_msg, page_id, user_key):
         cl = active_clients.get(page_key)
         if not cl:
             try:
-                cl, user_info = get_instagram_client(page_key, status_row['session_id'])
+                cl, user_info, error_msg = get_instagram_client(page_key, status_row['session_id'])
                 if cl and user_info:
                     active_clients[page_key] = cl
                 else:
-                    raise Exception("Failed to restore session")
+                    raise Exception(error_msg or "Failed to restore session")
             except Exception as ex:
                 conn.execute('UPDATE user_raids SET failed_count = failed_count + 1 WHERE user_key = ?', (page_key,))
                 conn.commit()
@@ -862,4 +854,11 @@ def handle_stop_raid(data):
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     print(f"Starting server on 0.0.0.0:{port}")
+    
+    # Check DNS at startup
+    if check_dns():
+        print("Network is ready")
+    else:
+        print("Warning: DNS resolution failed. Please check network connectivity.")
+    
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
