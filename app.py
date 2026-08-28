@@ -13,10 +13,13 @@ from instagrapi.exceptions import LoginRequired
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret_key_pratik_secure_2026'
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 DB_FILE = 'raid_console_data.db'
 DELAYS = [24, 45, 20, 15, 40]
+
+# --- IPLOOP PROXY SETUP ---
+PROXY_URL = "http://:iploop_f411a63e_70510c4fba4be3775840888cefae319bfd4d2b20@proxy.iploop.io:8880"
 
 # --- DATABASE SETUP ---
 def init_db():
@@ -65,32 +68,45 @@ def save_log(user_key, message, log_type):
 
 active_clients = {}
 
-# Instagram v2 device settings
+# Instagram device settings
 DEVICE_SETTINGS = {
     "app_version": "330.0.0.34.90",
     "android_version": 31,
     "android_release": "12.0",
     "dpi": "480dpi",
     "resolution": "1080x2340",
-    "manufacturer": "Samsung",
-    "device": "beyond2q",
-    "model": "SM-G975F",
-    "cpu": "exynos9820"
+    "manufacturer": "Xiaomi",
+    "device": "redmi_note_8",
+    "model": "Redmi Note 8",
+    "cpu": "qcom",
+    "timezone_offset": 19800,
+    "country": "IN",
 }
 
 HEADERS = {
-    "User-Agent": "Instagram 330.0.0.34.90 Android (31/12; 480dpi; 1080x2340; Samsung; SM-G975F; beyond2q; exynos9820; en_US)",
+    "User-Agent": "Instagram 330.0.0.34.90 Android (31/12; 480dpi; 1080x2340; Xiaomi; redmi_note_8; Redmi Note 8; qcom; en_US)",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate",
     "Connection": "close",
 }
 
-def get_instagram_client(user_key, session_id):
+def get_instagram_client(user_key, session_id=None, username=None, password=None):
     try:
         cl = Client()
+        
+        # --- ADD PROXY ---
+        cl.set_proxy(PROXY_URL)
+        
         cl.set_device(DEVICE_SETTINGS)
         cl.set_user_agent(HEADERS["User-Agent"])
-        cl.login_by_sessionid(session_id)
+        
+        if username and password:
+            cl.login(username, password)
+        elif session_id:
+            cl.login_by_sessionid(session_id)
+        else:
+            return None, None
+            
         user_info = cl.account_info()
         
         if user_info and user_info.pk:
@@ -102,18 +118,22 @@ def get_instagram_client(user_key, session_id):
         print(f"Login error: {e}")
         return None, None
 
-def verify_session(session_id):
+def verify_credentials(username, password):
     try:
         cl = Client()
+        
+        # --- ADD PROXY ---
+        cl.set_proxy(PROXY_URL)
+        
         cl.set_device(DEVICE_SETTINGS)
         cl.set_user_agent(HEADERS["User-Agent"])
-        cl.login_by_sessionid(session_id)
+        cl.login(username, password)
         user_info = cl.account_info()
         if user_info and user_info.pk:
             return True, user_info.username
         return False, None
     except Exception as e:
-        print(f"Session verification failed: {e}")
+        print(f"Verification failed: {e}")
         return False, None
 
 # HTML TEMPLATE
@@ -227,8 +247,16 @@ HTML_TEMPLATE = """
             <h2 class="panel-title">CONTROL PANEL</h2>
             <div class="form-group">
                 <div class="input-group">
-                    <label for="sessionId">SESSION ID</label>
-                    <input type="text" id="sessionId" placeholder="Enter Instagram Session ID">
+                    <label for="username">INSTAGRAM USERNAME</label>
+                    <input type="text" id="username" placeholder="Enter your Instagram username">
+                </div>
+                <div class="input-group">
+                    <label for="password">PASSWORD</label>
+                    <input type="password" id="password" placeholder="Enter your password">
+                </div>
+                <div class="input-group">
+                    <label for="sessionId">SESSION ID (Optional)</label>
+                    <input type="text" id="sessionId" placeholder="Or use Session ID instead">
                 </div>
                 <div class="button-group">
                     <button class="btn btn-login" onclick="login()">LOGIN</button>
@@ -394,6 +422,7 @@ HTML_TEMPLATE = """
             if (data.page_id && data.page_id !== currentPageId) return;
             if (data.user_key && data.user_key !== userKey) return;
             
+            document.getElementById('username').value = data.username !== 'NOT LOGGED IN' ? '' : '';
             document.getElementById('sessionId').value = data.session_id || '';
             document.getElementById('threadId').value = data.thread_id || '';
             if (data.message) document.getElementById('message').value = data.message;
@@ -448,13 +477,25 @@ HTML_TEMPLATE = """
         }
 
         function login() {
+            const username = document.getElementById('username').value.trim();
+            const password = document.getElementById('password').value.trim();
             const sid = document.getElementById('sessionId').value.trim();
-            if (sid) {
+            
+            if (username && password) {
+                socket.emit('login', { 
+                    username: username,
+                    password: password,
+                    page_id: currentPageId,
+                    user_key: userKey 
+                });
+            } else if (sid) {
                 socket.emit('login', { 
                     session_id: sid, 
                     page_id: currentPageId,
                     user_key: userKey 
                 });
+            } else {
+                alert('Please enter either username/password OR session ID');
             }
         }
 
@@ -602,44 +643,55 @@ def handle_login(data):
     user_key = data.get('user_key')
     page_id = data.get('page_id')
     session_id = data.get('session_id')
+    username = data.get('username')
+    password = data.get('password')
     page_key = f"{user_key}_{page_id}"
     
-    if not session_id:
-        msg = "Please enter a session ID"
+    # Check if we have login credentials
+    if not session_id and not (username and password):
+        msg = "Please enter session ID OR username and password"
         save_log(page_key, msg, 'error')
         emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
         return
     
     try:
-        is_valid, username = verify_session(session_id)
+        cl = Client()
         
-        if not is_valid:
-            msg = "Session ID is invalid or expired. Please get a new session ID."
-            save_log(page_key, msg, 'error')
-            emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
-            emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
-            return
+        # --- ADD PROXY ---
+        cl.set_proxy(PROXY_URL)
         
-        cl, user_info = get_instagram_client(page_key, session_id)
+        cl.set_device(DEVICE_SETTINGS)
+        cl.set_user_agent(HEADERS["User-Agent"])
         
-        if not cl or not user_info:
-            msg = "Failed to create Instagram client. Please try again."
-            save_log(page_key, msg, 'error')
-            emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
-            emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
-            return
+        # Try username/password first (more reliable on Render)
+        if username and password:
+            cl.login(username, password)
+        elif session_id:
+            cl.login_by_sessionid(session_id)
+        else:
+            raise Exception("No valid login method provided")
         
+        user_info = cl.account_info()
+        
+        if not user_info or not user_info.pk:
+            raise Exception("Failed to get account info")
+        
+        # Login successful
         active_clients[page_key] = cl
         
+        # Save session for future use
+        session_file = f"session_{page_key}.json"
+        cl.dump_settings(session_file)
+        
         if page_key in page_data:
-            page_data[page_key]['session_id'] = session_id
+            page_data[page_key]['session_id'] = session_id or 'session_saved'
             page_data[page_key]['username'] = user_info.username
         
         conn = get_db_connection()
         conn.execute('''
             INSERT INTO user_raids (user_key, session_id, username) VALUES (?, ?, ?)
             ON CONFLICT(user_key) DO UPDATE SET session_id=?, username=?
-        ''', (page_key, session_id, user_info.username, session_id, user_info.username))
+        ''', (page_key, session_id or 'session_saved', user_info.username, session_id or 'session_saved', user_info.username))
         conn.commit()
         conn.close()
         
@@ -649,7 +701,13 @@ def handle_login(data):
         emit('console_message', {'message': msg, 'type': 'success', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
         
     except Exception as e:
-        msg = f"LOGIN FAILED: {str(e)}"
+        error_msg = str(e)
+        if "login" in error_msg.lower() or "password" in error_msg.lower() or "username" in error_msg.lower():
+            msg = f"LOGIN FAILED: Invalid username or password. Please check your credentials."
+        elif "session" in error_msg.lower():
+            msg = f"LOGIN FAILED: Invalid or expired session ID. Please get a new one."
+        else:
+            msg = f"LOGIN FAILED: {error_msg}"
         save_log(page_key, msg, 'error')
         emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
         emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
@@ -815,6 +873,6 @@ def handle_stop_raid(data):
     emit('update_stats', {'raid_status': 'STOPPED', 'page_id': page_id, 'user_key': user_key}, room=page_key)
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 25100))
+    port = int(os.environ.get('PORT', 8080))
     print(f"Starting server on 0.0.0.0:{port}")
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
