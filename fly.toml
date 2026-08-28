@@ -1,0 +1,32 @@
+app = "pratik-panel"
+primary_region = "sin"
+kill_signal = "SIGINT"
+kill_timeout = 5
+
+[build]
+  builder = "dockerfile"
+
+[env]
+  PORT = "8080"
+  PYTHON_VERSION = "3.10.12"
+  PYTHONUNBUFFERED = "1"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[[http_service.checks]]
+  grace_period = "5s"
+  interval = "10s"
+  timeout = "2s"
+  path = "/health"
+  method = "GET"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256
