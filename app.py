@@ -18,8 +18,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 DB_FILE = 'raid_console_data.db'
 DELAYS = [24, 45, 20, 15, 40]
 
-# --- IPLOOP PROXY SETUP ---
-PROXY_URL = "http://:iploop_f411a63e_70510c4fba4be3775840888cefae319bfd4d2b20@proxy.iploop.io:8880"
+# --- PROXY REMOVED ---
 
 # --- DATABASE SETUP ---
 def init_db():
@@ -93,10 +92,6 @@ HEADERS = {
 def get_instagram_client(user_key, session_id=None, username=None, password=None):
     try:
         cl = Client()
-        
-        # --- ADD PROXY ---
-        cl.set_proxy(PROXY_URL)
-        
         cl.set_device(DEVICE_SETTINGS)
         cl.set_user_agent(HEADERS["User-Agent"])
         
@@ -121,10 +116,6 @@ def get_instagram_client(user_key, session_id=None, username=None, password=None
 def verify_credentials(username, password):
     try:
         cl = Client()
-        
-        # --- ADD PROXY ---
-        cl.set_proxy(PROXY_URL)
-        
         cl.set_device(DEVICE_SETTINGS)
         cl.set_user_agent(HEADERS["User-Agent"])
         cl.login(username, password)
@@ -656,10 +647,6 @@ def handle_login(data):
     
     try:
         cl = Client()
-        
-        # --- ADD PROXY ---
-        cl.set_proxy(PROXY_URL)
-        
         cl.set_device(DEVICE_SETTINGS)
         cl.set_user_agent(HEADERS["User-Agent"])
         
