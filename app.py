@@ -5,6 +5,7 @@ import sqlite3
 import random
 import threading
 import json
+import requests
 from flask import Flask, render_template_string, request, session
 from flask_socketio import SocketIO, emit, join_room
 import instagrapi
@@ -18,9 +19,58 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 DB_FILE = 'raid_console_data.db'
 DELAYS = [24, 45, 20, 15, 40]
 
-# PROXY CONFIGURATION
-PROXY_URL = "http://eoktrcfi:kdc6a477zqf7@31.59.20.176:6754/"
-USE_PROXY = True  # Set to False to disable proxy
+# PROXY CONFIGURATION - TRY DIFFERENT PROXIES
+PROXY_URLS = [
+    "http://eoktrcfi:kdc6a477zqf7@31.59.20.176:6754/",
+    # Add more proxies here if you have them
+    # "http://user:pass@ip:port/",
+]
+
+USE_PROXY = True
+CURRENT_PROXY_INDEX = 0
+
+def test_proxy(proxy_url):
+    """Test if proxy is working"""
+    try:
+        proxies = {
+            'http': proxy_url,
+            'https': proxy_url
+        }
+        response = requests.get('https://api.ipify.org?format=json', proxies=proxies, timeout=10)
+        if response.status_code == 200:
+            ip_data = response.json()
+            print(f"✅ Proxy working! IP: {ip_data.get('ip', 'Unknown')}")
+            return True, ip_data.get('ip', 'Unknown')
+        return False, None
+    except Exception as e:
+        print(f"❌ Proxy test failed: {e}")
+        return False, None
+
+def get_working_proxy():
+    """Get a working proxy from the list"""
+    global CURRENT_PROXY_INDEX
+    
+    if not USE_PROXY:
+        return None
+    
+    # Try all proxies
+    for i, proxy in enumerate(PROXY_URLS):
+        working, ip = test_proxy(proxy)
+        if working:
+            CURRENT_PROXY_INDEX = i
+            print(f"✅ Using working proxy: {proxy} (IP: {ip})")
+            return proxy
+    
+    print("❌ No working proxies found! Disabling proxy...")
+    return None
+
+# Test proxy on startup
+WORKING_PROXY = get_working_proxy()
+if WORKING_PROXY:
+    PROXY_URL = WORKING_PROXY
+else:
+    PROXY_URL = None
+    USE_PROXY = False
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -72,39 +122,71 @@ def get_instagram_client(user_key, session_id):
     try:
         cl = Client()
         
-        # Apply proxy if enabled
+        # Apply proxy if enabled and available
         if USE_PROXY and PROXY_URL:
-            cl.set_proxy(PROXY_URL)
-            print(f"Using proxy: {PROXY_URL}")
+            try:
+                cl.set_proxy(PROXY_URL)
+                print(f"✅ Using proxy: {PROXY_URL}")
+            except Exception as e:
+                print(f"⚠️ Proxy setup failed: {e}")
+                # Try without proxy
+                print("🔄 Trying without proxy...")
         
+        # Try login with session
+        print(f"🔄 Attempting login with session ID: {session_id[:10]}...")
         cl.login_by_sessionid(session_id)
-        user_info = cl.account_info()
         
+        # Verify login
+        user_info = cl.account_info()
         if user_info and user_info.pk:
+            print(f"✅ Login successful! User: {user_info.username}")
             session_file = f"session_{user_key}.json"
             cl.dump_settings(session_file)
             return cl, user_info
+        
+        print("❌ Login failed: No user info returned")
         return None, None
+        
     except Exception as e:
-        print(f"Login error: {e}")
+        print(f"❌ Login error: {e}")
         return None, None
 
 def verify_session(session_id):
     try:
         cl = Client()
         
-        # Apply proxy if enabled
+        # Apply proxy if enabled and available
         if USE_PROXY and PROXY_URL:
-            cl.set_proxy(PROXY_URL)
-            print(f"Verifying with proxy: {PROXY_URL}")
+            try:
+                cl.set_proxy(PROXY_URL)
+                print(f"✅ Verifying with proxy: {PROXY_URL}")
+            except Exception as e:
+                print(f"⚠️ Proxy setup failed: {e}")
+                print("🔄 Trying without proxy...")
         
+        # Try login
+        print(f"🔄 Verifying session: {session_id[:10]}...")
         cl.login_by_sessionid(session_id)
         user_info = cl.account_info()
+        
         if user_info and user_info.pk:
+            print(f"✅ Session valid! User: {user_info.username}")
             return True, user_info.username
+        
+        print("❌ Session invalid: No user info")
+        return False, None
+        
+    except instagrapi.exceptions.LoginRequired as e:
+        print(f"❌ Login required error: {e}")
+        return False, None
+    except instagrapi.exceptions.PleaseWaitFewMinutes as e:
+        print(f"⏳ Rate limited: {e}")
+        return False, None
+    except instagrapi.exceptions.ChallengeRequired as e:
+        print(f"🔒 Challenge required: {e}")
         return False, None
     except Exception as e:
-        print(f"Session verification failed: {e}")
+        print(f"❌ Verification error: {e}")
         return False, None
 
 HTML_TEMPLATE = """
@@ -591,6 +673,7 @@ def handle_login(data):
         return
     
     try:
+        # First try with proxy if available
         is_valid, username = verify_session(session_id)
         
         if not is_valid:
@@ -602,7 +685,7 @@ def handle_login(data):
         
         cl, user_info = get_instagram_client(page_key, session_id)
         if not cl or not user_info:
-            msg = "Failed to create Instagram client."
+            msg = "Failed to create Instagram client. Try with a different session ID or proxy."
             save_log(page_key, msg, 'error')
             emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
             emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
@@ -791,4 +874,4 @@ def handle_stop_raid(data):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
-    socketio.run(app, host='0.0.0.0', port=port, debug=False)
+    socketio.run(app, host='0.0.0.0', port=port, debug=True)
