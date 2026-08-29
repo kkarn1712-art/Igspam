@@ -18,6 +18,10 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 DB_FILE = 'raid_console_data.db'
 DELAYS = [24, 45, 20, 15, 40]
 
+# PROXY CONFIGURATION
+PROXY_URL = "http://eoktrcfi:kdc6a477zqf7@31.59.20.176:6754/"
+USE_PROXY = True  # Set to False to disable proxy
+
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -67,6 +71,12 @@ active_clients = {}
 def get_instagram_client(user_key, session_id):
     try:
         cl = Client()
+        
+        # Apply proxy if enabled
+        if USE_PROXY and PROXY_URL:
+            cl.set_proxy(PROXY_URL)
+            print(f"Using proxy: {PROXY_URL}")
+        
         cl.login_by_sessionid(session_id)
         user_info = cl.account_info()
         
@@ -82,6 +92,12 @@ def get_instagram_client(user_key, session_id):
 def verify_session(session_id):
     try:
         cl = Client()
+        
+        # Apply proxy if enabled
+        if USE_PROXY and PROXY_URL:
+            cl.set_proxy(PROXY_URL)
+            print(f"Verifying with proxy: {PROXY_URL}")
+        
         cl.login_by_sessionid(session_id)
         user_info = cl.account_info()
         if user_info and user_info.pk:
@@ -578,7 +594,7 @@ def handle_login(data):
         is_valid, username = verify_session(session_id)
         
         if not is_valid:
-            msg = "Session ID is invalid or expired."
+            msg = "Session ID is invalid or expired. Make sure proxy is working."
             save_log(page_key, msg, 'error')
             emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
             emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
