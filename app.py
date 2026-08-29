@@ -9,18 +9,15 @@ from flask import Flask, render_template_string, request, session
 from flask_socketio import SocketIO, emit, join_room
 import instagrapi
 from instagrapi import Client
-from instagrapi.exceptions import LoginRequired
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret_key_pratik_secure_2026'
 
-# Render/WSGI async mode compatibility for WebSockets
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
 DB_FILE = 'raid_console_data.db'
 DELAYS = [24, 45, 20, 15, 40]
 
-# --- DATABASE SETUP ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -67,30 +64,9 @@ def save_log(user_key, message, log_type):
 
 active_clients = {}
 
-DEVICE_SETTINGS = {
-    "app_version": "330.0.0.34.90",
-    "android_version": 31,
-    "android_release": "12.0",
-    "dpi": "480dpi",
-    "resolution": "1080x2340",
-    "manufacturer": "Samsung",
-    "device": "beyond2q",
-    "model": "SM-G975F",
-    "cpu": "exynos9820"
-}
-
-HEADERS = {
-    "User-Agent": "Instagram 330.0.0.34.90 Android (31/12; 480dpi; 1080x2340; Samsung; SM-G975F; beyond2q; exynos9820; en_US)",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
-    "Connection": "close",
-}
-
 def get_instagram_client(user_key, session_id):
     try:
         cl = Client()
-        cl.set_device(DEVICE_SETTINGS)
-        cl.set_user_agent(HEADERS["User-Agent"])
         cl.login_by_sessionid(session_id)
         user_info = cl.account_info()
         
@@ -106,8 +82,6 @@ def get_instagram_client(user_key, session_id):
 def verify_session(session_id):
     try:
         cl = Client()
-        cl.set_device(DEVICE_SETTINGS)
-        cl.set_user_agent(HEADERS["User-Agent"])
         cl.login_by_sessionid(session_id)
         user_info = cl.account_info()
         if user_info and user_info.pk:
@@ -117,7 +91,6 @@ def verify_session(session_id):
         print(f"Session verification failed: {e}")
         return False, None
 
-# HTML TEMPLATE
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -502,10 +475,8 @@ def handle_connect():
 def handle_register_page(data):
     user_key = data.get('user_key')
     page_id = data.get('page_id')
-    
     if not user_key or not page_id:
         return
-    
     page_key = f"{user_key}_{page_id}"
     
     if page_key not in page_data:
@@ -585,10 +556,8 @@ def handle_unregister_page(data):
     user_key = data.get('user_key')
     page_id = data.get('page_id')
     page_key = f"{user_key}_{page_id}"
-    
     if page_key in page_data:
         del page_data[page_key]
-    
     if page_key in active_clients:
         del active_clients[page_key]
 
@@ -609,16 +578,15 @@ def handle_login(data):
         is_valid, username = verify_session(session_id)
         
         if not is_valid:
-            msg = "Session ID is invalid or expired. Please get a new session ID."
+            msg = "Session ID is invalid or expired."
             save_log(page_key, msg, 'error')
             emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
             emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
             return
         
         cl, user_info = get_instagram_client(page_key, session_id)
-        
         if not cl or not user_info:
-            msg = "Failed to create Instagram client. Please try again."
+            msg = "Failed to create Instagram client."
             save_log(page_key, msg, 'error')
             emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
             emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
@@ -698,7 +666,7 @@ def handle_start_raid(data):
 
     if user_data['is_active']:
         conn.close()
-        msg = "[ERROR] A raid is already running for this page."
+        msg = "[ERROR] Raid is already running."
         save_log(page_key, msg, 'warning')
         emit('console_message', {'message': msg, 'type': 'warning', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
         return
@@ -722,9 +690,7 @@ def handle_start_raid(data):
     threading.Thread(target=run_raid, args=(page_key, thread_id, message_text, page_id, user_key)).start()
 
 def run_raid(page_key, target_thread, target_msg, page_id, user_key):
-    delay_index = 0
     counter = 0
-    
     while True:
         conn = get_db_connection()
         status_row = conn.execute('SELECT is_active, session_id, sent_count, failed_count FROM user_raids WHERE user_key = ?', (page_key,)).fetchone()
@@ -740,12 +706,12 @@ def run_raid(page_key, target_thread, target_msg, page_id, user_key):
                 if cl and user_info:
                     active_clients[page_key] = cl
                 else:
-                    raise Exception("Failed to restore session")
+                    raise Exception("Restore failed")
             except Exception as ex:
                 conn.execute('UPDATE user_raids SET failed_count = failed_count + 1 WHERE user_key = ?', (page_key,))
                 conn.commit()
                 conn.close()
-                err_msg = f"ERROR: Session restoration failed: {str(ex)}"
+                err_msg = f"ERROR: Session restore failed: {str(ex)}"
                 save_log(page_key, err_msg, 'error')
                 socketio.emit('console_message', {'message': err_msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
                 time.sleep(10)
@@ -758,7 +724,7 @@ def run_raid(page_key, target_thread, target_msg, page_id, user_key):
             conn.commit()
             
             updated_sent = status_row['sent_count'] + 1
-            out_msg = f"Sent #{counter} → {target_msg}"
+            out_msg = f"Sent #{counter} -> {target_msg}"
             save_log(page_key, out_msg, 'success')
             
             socketio.emit('console_message', {'message': out_msg, 'type': 'success', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
@@ -777,8 +743,6 @@ def run_raid(page_key, target_thread, target_msg, page_id, user_key):
         conn.close()
 
         current_delay = random.choice(DELAYS)
-        delay_index += 1
-
         for _ in range(int(current_delay)):
             check_conn = get_db_connection()
             check_active = check_conn.execute('SELECT is_active FROM user_raids WHERE user_key = ?', (page_key,)).fetchone()
