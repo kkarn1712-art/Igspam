@@ -4,3 +4,4 @@ instagrapi
 gunicorn
 gevent
 gevent-websocket
+packaging
