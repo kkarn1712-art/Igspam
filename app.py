@@ -1,252 +1,814 @@
-import asyncio
-import random
-import uuid
 import os
-import json
+import time
+import uuid
+import sqlite3
+import random
 import threading
-import logging
-from flask import Flask, jsonify, Response
+import json
+from flask import Flask, render_template_string, request, session
+from flask_socketio import SocketIO, emit, join_room
+import instagrapi
 from instagrapi import Client
-from instagrapi.exceptions import LoginRequired, RateLimitError
-
-logging.getLogger('werkzeug').setLevel(logging.ERROR)
-
-USERNAME = "xyz.enters30"
-PASSWORD = "ankushgodhu"
-
-SESSION_FILE = f"session_{USERNAME}.json"
-
-MSG_DELAY = 30
-GROUP_DELAY = 4
-ERROR_COOLDOWN = 3
-
-MESSAGE_FILE = "text.txt"
-TITLE_FILE = "nc.txt"
-
-DOC_ID = "29088580780787855"
-IG_APP_ID = "936619743392459"
-
-USERS = [USERNAME]
-logs_ui = {USERNAME: []}
-
-def log_line(text):
-    logs_ui[USERNAME].append(text)
-    if len(logs_ui[USERNAME]) > 200:
-        logs_ui[USERNAME].pop(0)
-    print(text)
-
-def load_lines(path):
-    if not os.path.exists(path):
-        print(f"❌ File missing: {path}")
-        exit()
-    with open(path, "r", encoding="utf-8") as f:
-        return [x.strip() for x in f if x.strip()]
-
-MESSAGES = load_lines(MESSAGE_FILE)
-TITLES = load_lines(TITLE_FILE)
-
-GREEN = "\033[92m"
-RESET = "\033[0m"
-
-cl = Client()
-login_lock = asyncio.Lock()
+from instagrapi.exceptions import LoginRequired
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = 'secret_key_pratik_secure_2026'
 
-@app.route('/')
-def home():
-    return "alive"
+# Render/WSGI async mode compatibility for WebSockets
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
-@app.route('/status')
-def status():
-    return jsonify({user: logs_ui[user] for user in USERS})
+DB_FILE = 'raid_console_data.db'
+DELAYS = [24, 45, 20, 15, 40]
 
-@app.route('/logs')
-def logs_route():
-    output = []
-    header_text = "✦  SINISTERS | SX⁷  ✦"
-    output.append(header_text)
-    output.append("=" * len(header_text))
-    output.append("")
-    for user in USERS:
-        output.append(f"[ {user} ]")
-        output.append("-" * (len(user) + 4))
-        for line in logs_ui[user]:
-            output.append(line)
-        output.append("")
-    return Response("\n".join(output), mimetype="text/plain")
+# --- DATABASE SETUP ---
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_raids (
+            user_key TEXT PRIMARY KEY,
+            session_id TEXT,
+            thread_id TEXT,
+            message TEXT,
+            is_active INTEGER DEFAULT 0,
+            sent_count INTEGER DEFAULT 0,
+            failed_count INTEGER DEFAULT 0,
+            username TEXT DEFAULT 'NOT LOGGED IN'
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS console_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_key TEXT,
+            log_message TEXT,
+            log_type TEXT,
+            timestamp TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-@app.route("/dashboard")
-def dashboard():
-    html = """
-    <html>
-    <head>
-        <title>SINISTERS | SX⁷</title>
-        <meta http-equiv="refresh" content="2">
-        <style>
-            body { background-color: #0d1117; font-family: monospace; margin: 0; padding: 20px; color: #00ff88; }
-            .header { text-align: center; font-size: 28px; font-weight: bold; margin-bottom: 30px; border: 2px solid #00ff88; padding: 10px; }
-            .container { display: flex; flex-direction: row; gap: 20px; align-items: flex-start; }
-            .panel { flex: 1; min-width: 300px; border: 2px solid #00ff88; background-color: #111827; padding: 15px; height: 80vh; overflow-y: auto; }
-            .panel-title { font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #00ff88; padding-bottom: 5px; }
-            .log-line { margin-bottom: 6px; white-space: pre-wrap; }
-        </style>
-    </head>
-    <body>
-        <div class="header">✦ SINISTERS | SX⁷ ✦</div>
-        <div class="container">
-    """
-    for user in USERS:
-        html += f'<div class="panel"><div class="panel-title">{user}</div>'
-        for line in logs_ui[user]:
-            html += f'<div class="log-line">{line}</div>'
-        html += "</div>"
-    html += """
+init_db()
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def save_log(user_key, message, log_type):
+    timestamp = time.strftime('%H:%M:%S')
+    conn = get_db_connection()
+    conn.execute(
+        'INSERT INTO console_logs (user_key, log_message, log_type, timestamp) VALUES (?, ?, ?, ?)',
+        (user_key, message, log_type, timestamp)
+    )
+    conn.commit()
+    conn.close()
+
+active_clients = {}
+
+DEVICE_SETTINGS = {
+    "app_version": "330.0.0.34.90",
+    "android_version": 31,
+    "android_release": "12.0",
+    "dpi": "480dpi",
+    "resolution": "1080x2340",
+    "manufacturer": "Samsung",
+    "device": "beyond2q",
+    "model": "SM-G975F",
+    "cpu": "exynos9820"
+}
+
+HEADERS = {
+    "User-Agent": "Instagram 330.0.0.34.90 Android (31/12; 480dpi; 1080x2340; Samsung; SM-G975F; beyond2q; exynos9820; en_US)",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "close",
+}
+
+def get_instagram_client(user_key, session_id):
+    try:
+        cl = Client()
+        cl.set_device(DEVICE_SETTINGS)
+        cl.set_user_agent(HEADERS["User-Agent"])
+        cl.login_by_sessionid(session_id)
+        user_info = cl.account_info()
+        
+        if user_info and user_info.pk:
+            session_file = f"session_{user_key}.json"
+            cl.dump_settings(session_file)
+            return cl, user_info
+        return None, None
+    except Exception as e:
+        print(f"Login error: {e}")
+        return None, None
+
+def verify_session(session_id):
+    try:
+        cl = Client()
+        cl.set_device(DEVICE_SETTINGS)
+        cl.set_user_agent(HEADERS["User-Agent"])
+        cl.login_by_sessionid(session_id)
+        user_info = cl.account_info()
+        if user_info and user_info.pk:
+            return True, user_info.username
+        return False, None
+    except Exception as e:
+        print(f"Session verification failed: {e}")
+        return False, None
+
+# HTML TEMPLATE
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PRATIK - SPAM PANEL</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Consolas', monospace; }
+        body { background-color: #0a0a0a; color: #0f0; min-height: 100vh; padding: 20px; overflow-x: hidden; }
+        
+        .header {
+            position: relative; text-align: center; margin-bottom: 15px; padding: 20px 70px;
+            background: linear-gradient(90deg, #ff0000, #ff7300, #fffb00, #48ff00, #00ffd5, #002bff, #7a00ff, #ff00c8, #ff0000);
+            background-size: 400% 400%; animation: gradient 15s ease infinite; border-radius: 10px;
+            box-shadow: 0 0 30px rgba(255, 0, 0, 0.5);
+        }
+        @keyframes gradient { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
+        
+        .icon-btn {
+            position: absolute; top: 50%; transform: translateY(-50%); background: rgba(0,0,0,0.6);
+            color: #00ff00; border: 2px solid #00ff00; border-radius: 8px; width: 50px; height: 50px;
+            font-size: 1.8rem; cursor: pointer; display: flex; align-items: center; justify-content: center;
+            transition: all 0.3s ease; z-index: 10;
+        }
+        .icon-btn:hover { background: #00ff00; color: #000; box-shadow: 0 0 15px #00ff00; }
+        .btn-menu { left: 15px; }
+        .btn-add { right: 15px; }
+
+        .tabs-bar { display: flex; gap: 10px; margin-bottom: 20px; overflow-x: auto; padding-bottom: 5px; }
+        .tab-item {
+            background: #111; color: #888; border: 1px solid #333; padding: 8px 16px; border-radius: 5px;
+            cursor: pointer; white-space: nowrap; display: flex; align-items: center; gap: 10px;
+        }
+        .tab-item.active { color: #00ff00; border-color: #00ff00; background: #1e1e1e; box-shadow: 0 0 10px rgba(0, 255, 0, 0.2); }
+        .tab-item .close-tab { color: #ff0000; font-weight: bold; }
+
+        .glowing-text { font-size: 3.5rem; font-weight: 900; color: white; text-shadow: 0 0 10px #ff0000, 0 0 20px #ff0000; letter-spacing: 2px; }
+
+        .drawer {
+            position: fixed; top: 0; left: -320px; width: 300px; height: 100%; background-color: #111;
+            border-right: 2px solid #00ff00; box-shadow: 5px 0 25px rgba(0, 255, 0, 0.3); transition: left 0.3s ease; z-index: 100; padding: 20px;
+        }
+        .drawer.open { left: 0; }
+        .drawer-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #00ff00; padding-bottom: 10px; margin-bottom: 20px; }
+        .drawer-close { background: none; border: none; color: #ff0000; font-size: 1.5rem; cursor: pointer; }
+        .pages-list { list-style: none; max-height: calc(100vh - 120px); overflow-y: auto; }
+        .pages-list li { background: #222; margin-bottom: 10px; padding: 12px; border-radius: 5px; border: 1px solid #444; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
+        .pages-list li:hover { border-color: #00ff00; }
+
+        .container { display: flex; gap: 20px; max-width: 1800px; margin: 0 auto; }
+        .left-panel { flex: 1; background-color: #111; border-radius: 10px; padding: 25px; border: 2px solid #ff0000; box-shadow: 0 0 20px rgba(255, 0, 0, 0.3); }
+        .right-panel { flex: 2; background-color: #111; border-radius: 10px; padding: 25px; border: 2px solid #00ff00; box-shadow: 0 0 20px rgba(0, 255, 0, 0.3); min-height: 600px; }
+        .panel-title { color: #ff0000; font-size: 1.8rem; margin-bottom: 20px; text-align: center; border-bottom: 2px solid #ff0000; text-shadow: 0 0 10px rgba(255, 0, 0, 0.5); }
+        .panel-title.green { color: #00ff00; border-bottom-color: #00ff00; text-shadow: 0 0 10px rgba(0, 255, 0, 0.5); }
+        
+        .form-group { background-color: #222; padding: 20px; border-radius: 10px; margin-bottom: 20px; }
+        .input-group { margin-bottom: 15px; }
+        .input-group label { display: block; color: #00ff00; margin-bottom: 8px; font-weight: bold; }
+        .input-group input, .input-group textarea { width: 100%; padding: 12px; background: #000; border: 1px solid #444; color: #0f0; border-radius: 5px; outline: none; }
+        .input-group input:focus, .input-group textarea:focus { border-color: #00ff00; }
+        textarea { resize: vertical; min-height: 100px; }
+        
+        .button-group { display: flex; gap: 15px; margin-top: 15px; }
+        .btn { flex: 1; padding: 15px; border: none; border-radius: 5px; font-size: 1.1rem; font-weight: bold; cursor: pointer; text-transform: uppercase; letter-spacing: 1px; }
+        .btn-login { background: linear-gradient(45deg, #ff0000, #ff4400); color: white; }
+        .btn-start { background: linear-gradient(45deg, #00ff00, #00cc00); color: black; }
+        .btn-stop { background: linear-gradient(45deg, #ff4444, #ff0000); color: white; }
+        
+        .stats { background-color: #222; padding: 20px; border-radius: 10px; margin-top: 20px; border: 1px solid #444; }
+        .stat-item { display: flex; justify-content: space-between; margin-bottom: 10px; color: #0f0; font-size: 1.1rem; }
+        
+        .console-container { background-color: #000; border-radius: 10px; padding: 20px; height: 500px; overflow-y: auto; border: 2px solid #333; }
+        .console-line { margin-bottom: 8px; padding-left: 10px; border-left: 3px solid transparent; animation: fadeIn 0.5s; }
+        .console-line.success { color: #00ff00; border-left-color: #00ff00; }
+        .console-line.error { color: #ff0000; border-left-color: #ff0000; }
+        .console-line.info { color: #00ffff; border-left-color: #00ffff; }
+        .console-line.warning { color: #ffff00; border-left-color: #ffff00; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: translateX(0); } }
+        
+        .status-indicator { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 8px; }
+        .status-online { background-color: #00ff00; box-shadow: 0 0 10px #00ff00; }
+        .status-offline { background-color: #ff0000; box-shadow: 0 0 10px #ff0000; }
+        
+        @media (max-width: 1200px) { .container { flex-direction: column; } .glowing-text { font-size: 2.5rem; } }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <button class="icon-btn btn-menu" onclick="toggleDrawer()">☰</button>
+        <h1 class="glowing-text">PRATIK SPAM PANEL</h1>
+        <button class="icon-btn btn-add" onclick="createNewPage(true)">+</button>
+    </div>
+
+    <div class="tabs-bar" id="tabsBar"></div>
+
+    <div class="drawer" id="pagesDrawer">
+        <div class="drawer-header">
+            <h3>PAGES CREATED (<span id="totalPagesCount">0</span>)</h3>
+            <button class="drawer-close" onclick="toggleDrawer()">✖</button>
         </div>
-        <script>
-        function scrollPanels() {
-            document.querySelectorAll('.panel').forEach(function(panel) {
-                panel.scrollTop = panel.scrollHeight;
+        <ul class="pages-list" id="pagesList"></ul>
+    </div>
+    
+    <div class="container">
+        <div class="left-panel">
+            <h2 class="panel-title">CONTROL PANEL</h2>
+            <div class="form-group">
+                <div class="input-group">
+                    <label for="sessionId">SESSION ID</label>
+                    <input type="text" id="sessionId" placeholder="Enter Instagram Session ID">
+                </div>
+                <div class="button-group">
+                    <button class="btn btn-login" onclick="login()">LOGIN</button>
+                    <button class="btn btn-stop" onclick="logout()">LOGOUT</button>
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <div class="input-group">
+                    <label for="threadId">THREAD ID</label>
+                    <input type="text" id="threadId" placeholder="Enter Thread ID">
+                </div>
+                <div class="input-group">
+                    <label for="message">MESSAGE</label>
+                    <textarea id="message" placeholder="Enter message..."></textarea>
+                </div>
+                <div class="button-group">
+                    <button class="btn btn-start" onclick="startSending()">START RAID</button>
+                    <button class="btn btn-stop" onclick="stopSending()">STOP RAID</button>
+                </div>
+            </div>
+            
+            <div class="stats">
+                <div id="statusDisplay"><span class="status-indicator status-offline"></span> STATUS: OFFLINE</div>
+                <div id="usernameDisplay">USERNAME: NOT LOGGED IN</div>
+                <hr style="border-color:#444; margin: 15px 0;">
+                <div class="stat-item"><span>MESSAGES SENT:</span><span id="sentCount">0</span></div>
+                <div class="stat-item"><span>FAILED:</span><span id="failedCount">0</span></div>
+                <div class="stat-item"><span>RAID STATUS:</span><span id="raidStatus">IDLE</span></div>
+            </div>
+        </div>
+        
+        <div class="right-panel">
+            <h2 class="panel-title green">LIVE CONSOLE</h2>
+            <div class="console-container" id="console"></div>
+        </div>
+    </div>
+    
+    <script>
+        let socket = io();
+        let storedPages = JSON.parse(localStorage.getItem('pratik_pages') || '[]');
+        let activePageId = localStorage.getItem('pratik_active_page');
+        
+        let userKey = localStorage.getItem('pratik_user_key');
+        if (!userKey) {
+            userKey = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+            localStorage.setItem('pratik_user_key', userKey);
+        }
+        
+        let currentPageId = activePageId || ('Page_' + Date.now());
+        
+        if (storedPages.length === 0) {
+            createNewPage(false);
+        } else {
+            if (!activePageId) {
+                activePageId = storedPages[0].id;
+                localStorage.setItem('pratik_active_page', activePageId);
+            }
+            currentPageId = activePageId;
+            renderTabs();
+            renderStoredPagesList();
+        }
+
+        socket.on('connect', function() {
+            socket.emit('register_page', { 
+                page_id: currentPageId,
+                user_key: userKey 
+            });
+        });
+
+        function createNewPage(userClicked = true) {
+            const pageId = 'Page_' + Date.now();
+            const newPage = {
+                id: pageId,
+                name: 'Console #' + (storedPages.length + 1),
+                created: new Date().toLocaleTimeString()
+            };
+            storedPages.push(newPage);
+            activePageId = pageId;
+            currentPageId = pageId;
+            savePages();
+            renderTabs();
+            renderStoredPagesList();
+            socket.emit('register_page', { 
+                page_id: pageId,
+                user_key: userKey 
             });
         }
-        window.onload = scrollPanels;
-        setInterval(scrollPanels, 1500);
-        </script>
-    </body>
-    </html>
-    """
-    return html
 
-def run_flask():
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+        function switchPage(pageId) {
+            activePageId = pageId;
+            currentPageId = pageId;
+            localStorage.setItem('pratik_active_page', activePageId);
+            renderTabs();
+            renderStoredPagesList();
+            socket.emit('register_page', { 
+                page_id: pageId,
+                user_key: userKey 
+            });
+            document.getElementById('console').innerHTML = '';
+            socket.emit('request_page_data', { 
+                page_id: pageId,
+                user_key: userKey 
+            });
+        }
 
-def setup_mobile_fingerprint():
-    cl.set_user_agent(
-        "Instagram 312.0.0.22.114 Android "
-        "(33/13; 420dpi; 1080x2400; OnePlus; "
-        "GM1913; OnePlus7Pro; qcom; en_US)"
-    )
-    cl.set_locale("en_US")
-    cl.set_country_code(1)
-    cl.set_timezone_offset(-18000)
+        function removePage(pageId, event) {
+            if (event) event.stopPropagation();
+            if (storedPages.length <= 1) return;
+            storedPages = storedPages.filter(p => p.id !== pageId);
+            if (activePageId === pageId) {
+                activePageId = storedPages[0].id;
+                currentPageId = activePageId;
+                localStorage.setItem('pratik_active_page', activePageId);
+            }
+            savePages();
+            renderTabs();
+            renderStoredPagesList();
+            socket.emit('unregister_page', { 
+                page_id: pageId,
+                user_key: userKey 
+            });
+        }
 
-    uuids = {
-        "phone_id": str(uuid.uuid4()),
-        "uuid": str(uuid.uuid4()),
-        "client_session_id": str(uuid.uuid4()),
-        "advertising_id": str(uuid.uuid4()),
-        "device_id": "android-" + uuid.uuid4().hex[:16]
-    }
+        function savePages() {
+            localStorage.setItem('pratik_pages', JSON.stringify(storedPages));
+            localStorage.setItem('pratik_active_page', activePageId);
+        }
 
-    cl.set_uuids(uuids)
+        function renderTabs() {
+            const tabsBar = document.getElementById('tabsBar');
+            tabsBar.innerHTML = storedPages.map(page => `
+                <div class="tab-item ${page.id === activePageId ? 'active' : ''}" onclick="switchPage('${page.id}')">
+                    <span>${page.name}</span>
+                    <span class="close-tab" onclick="removePage('${page.id}', event)">✖</span>
+                </div>
+            `).join('');
+        }
 
-    cl.private.headers.update({
-        "X-IG-App-ID": IG_APP_ID,
-        "X-IG-Device-ID": uuids["uuid"],
-        "X-IG-Android-ID": uuids["device_id"],
-        "X-IG-Timezone-Offset": "-18000",
-        "Accept-Language": "en-US",
-        "Connection": "keep-alive"
-    })
+        function renderStoredPagesList() {
+            const list = document.getElementById('pagesList');
+            document.getElementById('totalPagesCount').textContent = storedPages.length;
+            list.innerHTML = storedPages.map(page => `
+                <li onclick="switchPage('${page.id}')">
+                    <div>
+                        <strong>${page.name}</strong><br>
+                        <small style="color:#777">Created: ${page.created}</small>
+                    </div>
+                    ${storedPages.length > 1 ? `<span style="color:#ff0000;" onclick="removePage('${page.id}', event)">Delete</span>` : ''}
+                </li>
+            `).join('');
+        }
 
-async def login():
-    async with login_lock:
-        if os.path.exists(SESSION_FILE):
-            try:
-                cl.load_settings(SESSION_FILE)
-                cl.login(USERNAME, PASSWORD)
-                cl.get_timeline_feed()
-                log_line(f"⏳SESSION LOGIN - {GREEN}{USERNAME}{RESET}")
-                return
-            except Exception:
-                pass
-        cl.login(USERNAME, PASSWORD)
-        cl.dump_settings(SESSION_FILE)
-        log_line(f"⏳FRESH LOGIN - {GREEN}{USERNAME}{RESET}")
+        function toggleDrawer() {
+            document.getElementById('pagesDrawer').classList.toggle('open');
+        }
 
-def fetch_group_threads():
+        socket.on('init_state', function(data) {
+            if (data.page_id && data.page_id !== currentPageId) return;
+            if (data.user_key && data.user_key !== userKey) return;
+            
+            document.getElementById('sessionId').value = data.session_id || '';
+            document.getElementById('threadId').value = data.thread_id || '';
+            if (data.message) document.getElementById('message').value = data.message;
+            
+            document.getElementById('sentCount').textContent = data.sent_count;
+            document.getElementById('failedCount').textContent = data.failed_count;
+            document.getElementById('raidStatus').textContent = data.is_active ? 'RUNNING' : 'STOPPED';
+            
+            if (data.username && data.username !== 'NOT LOGGED IN') {
+                document.getElementById('statusDisplay').innerHTML = '<span class="status-indicator status-online"></span> STATUS: ONLINE';
+                document.getElementById('usernameDisplay').textContent = 'USERNAME: ' + data.username;
+            }
+            
+            const consoleDiv = document.getElementById('console');
+            consoleDiv.innerHTML = '';
+            data.logs.forEach(log => {
+                addConsoleMessage(`[${log.timestamp}] ${log.log_message}`, log.log_type, false);
+            });
+            consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        });
+
+        socket.on('console_message', function(data) {
+            if (data.page_id && data.page_id !== currentPageId) return;
+            if (data.user_key && data.user_key !== userKey) return;
+            addConsoleMessage(`[${data.timestamp}] ${data.message}`, data.type, true);
+        });
+
+        socket.on('update_stats', function(data) {
+            if (data.page_id && data.page_id !== currentPageId) return;
+            if (data.user_key && data.user_key !== userKey) return;
+            if (data.sent !== undefined) document.getElementById('sentCount').textContent = data.sent;
+            if (data.failed !== undefined) document.getElementById('failedCount').textContent = data.failed;
+            if (data.raid_status) document.getElementById('raidStatus').textContent = data.raid_status;
+        });
+
+        socket.on('login_status', function(data) {
+            if (data.page_id && data.page_id !== currentPageId) return;
+            if (data.user_key && data.user_key !== userKey) return;
+            if (data.success) {
+                document.getElementById('statusDisplay').innerHTML = '<span class="status-indicator status-online"></span> STATUS: ONLINE';
+                document.getElementById('usernameDisplay').textContent = 'USERNAME: ' + data.username;
+            }
+        });
+
+        function addConsoleMessage(message, type = 'info', scroll = true) {
+            const consoleDiv = document.getElementById('console');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `console-line ${type}`;
+            messageDiv.textContent = message;
+            consoleDiv.appendChild(messageDiv);
+            if (scroll) consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        }
+
+        function login() {
+            const sid = document.getElementById('sessionId').value.trim();
+            if (sid) {
+                socket.emit('login', { 
+                    session_id: sid, 
+                    page_id: currentPageId,
+                    user_key: userKey 
+                });
+            }
+        }
+
+        function logout() {
+            socket.emit('logout', { 
+                page_id: currentPageId,
+                user_key: userKey 
+            });
+            document.getElementById('statusDisplay').innerHTML = '<span class="status-indicator status-offline"></span> STATUS: OFFLINE';
+            document.getElementById('usernameDisplay').textContent = 'USERNAME: NOT LOGGED IN';
+        }
+
+        function startSending() {
+            const threadId = document.getElementById('threadId').value.trim();
+            const message = document.getElementById('message').value.trim();
+            if (threadId && message) {
+                socket.emit('start_raid', { 
+                    thread_id: threadId, 
+                    message: message,
+                    page_id: currentPageId,
+                    user_key: userKey 
+                });
+            }
+        }
+
+        function stopSending() {
+            socket.emit('stop_raid', { 
+                page_id: currentPageId,
+                user_key: userKey 
+            });
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+page_data = {}
+
+@socketio.on('connect')
+def handle_connect():
+    print("Client connected")
+
+@socketio.on('register_page')
+def handle_register_page(data):
+    user_key = data.get('user_key')
+    page_id = data.get('page_id')
+    
+    if not user_key or not page_id:
+        return
+    
+    page_key = f"{user_key}_{page_id}"
+    
+    if page_key not in page_data:
+        page_data[page_key] = {
+            'user_key': user_key,
+            'page_id': page_id,
+            'session_id': '',
+            'thread_id': '',
+            'message': '',
+            'is_active': False,
+            'sent_count': 0,
+            'failed_count': 0,
+            'username': 'NOT LOGGED IN'
+        }
+    
+    join_room(page_key)
+    
+    conn = get_db_connection()
+    user_data = conn.execute('SELECT * FROM user_raids WHERE user_key = ?', (page_key,)).fetchone()
+    logs = conn.execute('SELECT log_message, log_type, timestamp FROM console_logs WHERE user_key = ? ORDER BY id ASC', (page_key,)).fetchall()
+    conn.close()
+    
+    if user_data:
+        emit('init_state', {
+            'page_id': page_id,
+            'user_key': user_key,
+            'session_id': user_data['session_id'] or '',
+            'thread_id': user_data['thread_id'] or '',
+            'message': user_data['message'] or '',
+            'is_active': bool(user_data['is_active']),
+            'sent_count': user_data['sent_count'] or 0,
+            'failed_count': user_data['failed_count'] or 0,
+            'username': user_data['username'] or 'NOT LOGGED IN',
+            'logs': [dict(log) for log in logs]
+        }, room=page_key)
+    else:
+        emit('init_state', {
+            'page_id': page_id,
+            'user_key': user_key,
+            'session_id': '',
+            'thread_id': '',
+            'message': '',
+            'is_active': False,
+            'sent_count': 0,
+            'failed_count': 0,
+            'username': 'NOT LOGGED IN',
+            'logs': []
+        }, room=page_key)
+
+@socketio.on('request_page_data')
+def handle_request_page_data(data):
+    user_key = data.get('user_key')
+    page_id = data.get('page_id')
+    page_key = f"{user_key}_{page_id}"
+    
+    conn = get_db_connection()
+    user_data = conn.execute('SELECT * FROM user_raids WHERE user_key = ?', (page_key,)).fetchone()
+    logs = conn.execute('SELECT log_message, log_type, timestamp FROM console_logs WHERE user_key = ? ORDER BY id ASC', (page_key,)).fetchall()
+    conn.close()
+    
+    if user_data:
+        emit('init_state', {
+            'page_id': page_id,
+            'user_key': user_key,
+            'session_id': user_data['session_id'] or '',
+            'thread_id': user_data['thread_id'] or '',
+            'message': user_data['message'] or '',
+            'is_active': bool(user_data['is_active']),
+            'sent_count': user_data['sent_count'] or 0,
+            'failed_count': user_data['failed_count'] or 0,
+            'username': user_data['username'] or 'NOT LOGGED IN',
+            'logs': [dict(log) for log in logs]
+        }, room=page_key)
+
+@socketio.on('unregister_page')
+def handle_unregister_page(data):
+    user_key = data.get('user_key')
+    page_id = data.get('page_id')
+    page_key = f"{user_key}_{page_id}"
+    
+    if page_key in page_data:
+        del page_data[page_key]
+    
+    if page_key in active_clients:
+        del active_clients[page_key]
+
+@socketio.on('login')
+def handle_login(data):
+    user_key = data.get('user_key')
+    page_id = data.get('page_id')
+    session_id = data.get('session_id')
+    page_key = f"{user_key}_{page_id}"
+    
+    if not session_id:
+        msg = "Please enter a session ID"
+        save_log(page_key, msg, 'error')
+        emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+        return
+    
     try:
-        threads = cl.direct_threads(amount=100)
-    except Exception:
-        return []
-    group_ids = []
-    for t in threads:
-        try:
-            if getattr(t, "is_group", False) and len(t.users) >= 2:
-                group_ids.append(t.id)
-        except Exception:
-            continue
-    log_line(f"🕸️ GCS - {GREEN}{len(group_ids)}{RESET}")
-    return group_ids
-
-async def api_call(func, *args, **kwargs):
-    return await asyncio.to_thread(func, *args, **kwargs)
-
-def graphql_rename(thread_id, title):
-    csrf = cl.private.cookies.get("csrftoken", "")
-    cl.private.headers.update({
-        "X-CSRFToken": csrf,
-        "Referer": f"https://www.instagram.com/direct/t/{thread_id}/"
-    })
-    payload = {
-        "doc_id": DOC_ID,
-        "variables": json.dumps({
-            "thread_fbid": str(thread_id),
-            "new_title": title
-        })
-    }
-    r = cl.private.post(
-        "https://www.instagram.com/api/graphql/",
-        data=payload,
-        timeout=10
-    )
-    return r.status_code == 200
-
-def rename_thread(thread_id, title):
-    try:
-        cl.private_request(
-            f"direct_v2/threads/{thread_id}/update_title/",
-            data={"title": title}
-        )
-        return True
-    except RateLimitError:
-        return graphql_rename(thread_id, title)
+        is_valid, username = verify_session(session_id)
+        
+        if not is_valid:
+            msg = "Session ID is invalid or expired. Please get a new session ID."
+            save_log(page_key, msg, 'error')
+            emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
+            emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+            return
+        
+        cl, user_info = get_instagram_client(page_key, session_id)
+        
+        if not cl or not user_info:
+            msg = "Failed to create Instagram client. Please try again."
+            save_log(page_key, msg, 'error')
+            emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
+            emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+            return
+        
+        active_clients[page_key] = cl
+        
+        if page_key in page_data:
+            page_data[page_key]['session_id'] = session_id
+            page_data[page_key]['username'] = user_info.username
+        
+        conn = get_db_connection()
+        conn.execute('''
+            INSERT INTO user_raids (user_key, session_id, username) VALUES (?, ?, ?)
+            ON CONFLICT(user_key) DO UPDATE SET session_id=?, username=?
+        ''', (page_key, session_id, user_info.username, session_id, user_info.username))
+        conn.commit()
+        conn.close()
+        
+        msg = f"LOGIN SUCCESS: {user_info.username}"
+        save_log(page_key, msg, 'success')
+        emit('login_status', {'success': True, 'username': user_info.username, 'page_id': page_id, 'user_key': user_key}, room=page_key)
+        emit('console_message', {'message': msg, 'type': 'success', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+        
     except Exception as e:
-        if "rate" in str(e).lower():
-            return graphql_rename(thread_id, title)
-        return False
+        msg = f"LOGIN FAILED: {str(e)}"
+        save_log(page_key, msg, 'error')
+        emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
+        emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
 
-async def process_groups(group_ids):
-    total = len(group_ids)
-    for i, gid in enumerate(group_ids, start=1):
+@socketio.on('logout')
+def handle_logout(data):
+    user_key = data.get('user_key')
+    page_id = data.get('page_id')
+    page_key = f"{user_key}_{page_id}"
+    
+    if page_key in active_clients:
+        del active_clients[page_key]
+    
+    session_file = f"session_{page_key}.json"
+    if os.path.exists(session_file):
         try:
-            msg = random.choice(MESSAGES)
-            await api_call(cl.direct_send, msg, thread_ids=[gid])
-            log_line(f"📨 - {i}/{total}")
-            await asyncio.sleep(MSG_DELAY)
-            title = random.choice(TITLES)
-            success = await api_call(rename_thread, gid, title)
-            if success:
-                log_line(f"💠 - {title}")
-            await asyncio.sleep(GROUP_DELAY)
-        except LoginRequired:
-            await login()
-        except Exception:
-            await asyncio.sleep(ERROR_COOLDOWN)
+            os.remove(session_file)
+        except:
+            pass
+    
+    if page_key in page_data:
+        page_data[page_key]['session_id'] = ''
+        page_data[page_key]['username'] = 'NOT LOGGED IN'
+    
+    conn = get_db_connection()
+    conn.execute('UPDATE user_raids SET username = "NOT LOGGED IN", session_id = "" WHERE user_key = ?', (page_key,))
+    conn.commit()
+    conn.close()
+    
+    msg = "Logged out"
+    save_log(page_key, msg, 'info')
+    emit('console_message', {'message': msg, 'type': 'info', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
 
-async def main():
-    setup_mobile_fingerprint()
-    await login()
-    round_num = 1
+@socketio.on('start_raid')
+def handle_start_raid(data):
+    user_key = data.get('user_key')
+    page_id = data.get('page_id')
+    thread_id = data.get('thread_id')
+    message_text = data.get('message')
+    page_key = f"{user_key}_{page_id}"
+
+    conn = get_db_connection()
+    user_data = conn.execute('SELECT * FROM user_raids WHERE user_key = ?', (page_key,)).fetchone()
+    
+    if not user_data or not user_data['session_id']:
+        conn.close()
+        msg = "[ERROR] Please login first."
+        save_log(page_key, msg, 'error')
+        emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+        return
+
+    if user_data['is_active']:
+        conn.close()
+        msg = "[ERROR] A raid is already running for this page."
+        save_log(page_key, msg, 'warning')
+        emit('console_message', {'message': msg, 'type': 'warning', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+        return
+
+    conn.execute('''
+        UPDATE user_raids SET thread_id=?, message=?, is_active=1 WHERE user_key=?
+    ''', (thread_id, message_text, page_key))
+    conn.commit()
+    conn.close()
+
+    if page_key in page_data:
+        page_data[page_key]['thread_id'] = thread_id
+        page_data[page_key]['message'] = message_text
+        page_data[page_key]['is_active'] = True
+
+    msg = f"Starting raid on thread: {thread_id}"
+    save_log(page_key, msg, 'warning')
+    emit('console_message', {'message': msg, 'type': 'warning', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+    emit('update_stats', {'raid_status': 'RUNNING', 'page_id': page_id, 'user_key': user_key}, room=page_key)
+
+    threading.Thread(target=run_raid, args=(page_key, thread_id, message_text, page_id, user_key)).start()
+
+def run_raid(page_key, target_thread, target_msg, page_id, user_key):
+    delay_index = 0
+    counter = 0
+    
     while True:
-        groups = fetch_group_threads()
-        if groups:
-            await process_groups(groups)
-        round_num += 1
-        log_line(f"\n🥤- ROUND {round_num} (120s wait)\n")
-        await asyncio.sleep(120)
+        conn = get_db_connection()
+        status_row = conn.execute('SELECT is_active, session_id, sent_count, failed_count FROM user_raids WHERE user_key = ?', (page_key,)).fetchone()
+        
+        if not status_row or not status_row['is_active']:
+            conn.close()
+            break
 
-if __name__ == "__main__":
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    asyncio.run(main())
+        cl = active_clients.get(page_key)
+        if not cl:
+            try:
+                cl, user_info = get_instagram_client(page_key, status_row['session_id'])
+                if cl and user_info:
+                    active_clients[page_key] = cl
+                else:
+                    raise Exception("Failed to restore session")
+            except Exception as ex:
+                conn.execute('UPDATE user_raids SET failed_count = failed_count + 1 WHERE user_key = ?', (page_key,))
+                conn.commit()
+                conn.close()
+                err_msg = f"ERROR: Session restoration failed: {str(ex)}"
+                save_log(page_key, err_msg, 'error')
+                socketio.emit('console_message', {'message': err_msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+                time.sleep(10)
+                continue
+
+        try:
+            counter += 1
+            cl.direct_send(target_msg, thread_ids=[target_thread])
+            conn.execute('UPDATE user_raids SET sent_count = sent_count + 1 WHERE user_key = ?', (page_key,))
+            conn.commit()
+            
+            updated_sent = status_row['sent_count'] + 1
+            out_msg = f"Sent #{counter} → {target_msg}"
+            save_log(page_key, out_msg, 'success')
+            
+            socketio.emit('console_message', {'message': out_msg, 'type': 'success', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+            socketio.emit('update_stats', {'sent': updated_sent, 'page_id': page_id, 'user_key': user_key}, room=page_key)
+        except Exception as e:
+            conn.execute('UPDATE user_raids SET failed_count = failed_count + 1 WHERE user_key = ?', (page_key,))
+            conn.commit()
+            
+            updated_failed = status_row['failed_count'] + 1
+            err_msg = f"ERROR: Failed to send: {str(e)}"
+            save_log(page_key, err_msg, 'error')
+            
+            socketio.emit('console_message', {'message': err_msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+            socketio.emit('update_stats', {'failed': updated_failed, 'page_id': page_id, 'user_key': user_key}, room=page_key)
+
+        conn.close()
+
+        current_delay = random.choice(DELAYS)
+        delay_index += 1
+
+        for _ in range(int(current_delay)):
+            check_conn = get_db_connection()
+            check_active = check_conn.execute('SELECT is_active FROM user_raids WHERE user_key = ?', (page_key,)).fetchone()
+            check_conn.close()
+            if not check_active or not check_active['is_active']:
+                socketio.emit('update_stats', {'raid_status': 'STOPPED', 'page_id': page_id, 'user_key': user_key}, room=page_key)
+                return
+            time.sleep(1)
+
+    socketio.emit('update_stats', {'raid_status': 'STOPPED', 'page_id': page_id, 'user_key': user_key}, room=page_key)
+
+@socketio.on('stop_raid')
+def handle_stop_raid(data):
+    user_key = data.get('user_key')
+    page_id = data.get('page_id')
+    page_key = f"{user_key}_{page_id}"
+    
+    conn = get_db_connection()
+    conn.execute('UPDATE user_raids SET is_active = 0 WHERE user_key = ?', (page_key,))
+    conn.commit()
+    conn.close()
+    
+    if page_key in page_data:
+        page_data[page_key]['is_active'] = False
+    
+    msg = "Stopping raid..."
+    save_log(page_key, msg, 'warning')
+    emit('console_message', {'message': msg, 'type': 'warning', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+    emit('update_stats', {'raid_status': 'STOPPED', 'page_id': page_id, 'user_key': user_key}, room=page_key)
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 10000))
+    socketio.run(app, host='0.0.0.0', port=port, debug=False)
