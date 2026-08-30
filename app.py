@@ -5,92 +5,21 @@ import sqlite3
 import random
 import threading
 import json
-import requests
 from flask import Flask, render_template_string, request, session
 from flask_socketio import SocketIO, emit, join_room
 import instagrapi
 from instagrapi import Client
+from instagrapi.exceptions import LoginRequired
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret_key_pratik_secure_2026'
-
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
-DB_FILE = 'raid_console_data.db'
+# Use /tmp for Railway (writable directory)
+DB_FILE = '/tmp/raid_console_data.db'
 DELAYS = [24, 45, 20, 15, 40]
 
-# PROXY CONFIGURATION - ADD MULTIPLE PROXIES
-PROXY_URLS = [
-    # Free proxies (might be slow/unreliable)
-    "http://eoktrcfi:kdc6a477zqf7@31.59.20.176:6754/",
-    
-    # Add more proxies here from free proxy sites
-    # Format: "http://user:pass@ip:port/" or "http://ip:port/"
-]
-
-# Try without proxy first if no working proxy found
-USE_PROXY = False  # Start with proxy disabled since the provided one is dead
-CURRENT_PROXY_INDEX = 0
-
-def test_proxy(proxy_url):
-    """Test if proxy is working"""
-    try:
-        proxies = {
-            'http': proxy_url,
-            'https': proxy_url
-        }
-        # Try multiple test endpoints
-        test_urls = [
-            'https://api.ipify.org?format=json',
-            'http://ip-api.com/json/',
-            'https://httpbin.org/ip'
-        ]
-        
-        for url in test_urls:
-            try:
-                response = requests.get(url, proxies=proxies, timeout=10)
-                if response.status_code == 200:
-                    print(f"✅ Proxy working! Response: {response.text[:100]}")
-                    return True, response.text
-            except:
-                continue
-        
-        return False, None
-    except Exception as e:
-        print(f"❌ Proxy test failed: {e}")
-        return False, None
-
-def get_working_proxy():
-    """Get a working proxy from the list"""
-    global CURRENT_PROXY_INDEX
-    
-    if not PROXY_URLS:
-        return None
-    
-    print("🔍 Testing proxies...")
-    
-    # Try all proxies
-    for i, proxy in enumerate(PROXY_URLS):
-        print(f"Testing proxy {i+1}/{len(PROXY_URLS)}: {proxy[:30]}...")
-        working, _ = test_proxy(proxy)
-        if working:
-            CURRENT_PROXY_INDEX = i
-            print(f"✅ Using working proxy: {proxy}")
-            return proxy
-    
-    print("❌ No working proxies found! Will try without proxy.")
-    return None
-
-# Test proxy on startup
-WORKING_PROXY = get_working_proxy()
-if WORKING_PROXY:
-    PROXY_URL = WORKING_PROXY
-    USE_PROXY = True
-else:
-    PROXY_URL = None
-    USE_PROXY = False
-    print("⚠️ Running without proxy - may not work if IP is blocked")
-
+# --- DATABASE SETUP ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -137,108 +66,59 @@ def save_log(user_key, message, log_type):
 
 active_clients = {}
 
+# Instagram device settings - makes it look like real device
+DEVICE_SETTINGS = {
+    "app_version": "330.0.0.34.90",
+    "android_version": 31,
+    "android_release": "12.0",
+    "dpi": "480dpi",
+    "resolution": "1080x2340",
+    "manufacturer": "Samsung",
+    "device": "beyond2q",
+    "model": "SM-G975F",
+    "cpu": "exynos9820"
+}
+
+HEADERS = {
+    "User-Agent": "Instagram 330.0.0.34.90 Android (31/12; 480dpi; 1080x2340; Samsung; SM-G975F; beyond2q; exynos9820; en_US)",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "close",
+}
+
 def get_instagram_client(user_key, session_id):
     try:
         cl = Client()
-        
-        # Apply proxy if enabled
-        if USE_PROXY and PROXY_URL:
-            try:
-                cl.set_proxy(PROXY_URL)
-                print(f"✅ Using proxy: {PROXY_URL}")
-            except Exception as e:
-                print(f"⚠️ Proxy setup failed: {e}")
-                print("🔄 Trying without proxy...")
-        
-        # Try login with session
-        print(f"🔄 Logging in with session ID: {session_id[:15]}...")
-        
-        # Set timeout and retry
-        cl.set_timeout(30)
-        
-        try:
-            cl.login_by_sessionid(session_id)
-        except Exception as login_err:
-            print(f"Login attempt failed: {login_err}")
-            # Try one more time without proxy if it failed with proxy
-            if USE_PROXY and PROXY_URL:
-                print("🔄 Retrying without proxy...")
-                cl = Client()
-                cl.set_timeout(30)
-                cl.login_by_sessionid(session_id)
-        
-        # Verify login
+        cl.set_device(DEVICE_SETTINGS)
+        cl.set_user_agent(HEADERS["User-Agent"])
+        cl.login_by_sessionid(session_id)
         user_info = cl.account_info()
+        
         if user_info and user_info.pk:
-            print(f"✅ Login successful! User: {user_info.username} (ID: {user_info.pk})")
-            session_file = f"session_{user_key}.json"
+            session_file = f"/tmp/session_{user_key}.json"
             cl.dump_settings(session_file)
             return cl, user_info
-        
-        print("❌ Login failed: No user info returned")
         return None, None
-        
     except Exception as e:
-        print(f"❌ Login error: {e}")
+        print(f"Login error: {e}")
         return None, None
 
 def verify_session(session_id):
     try:
         cl = Client()
-        
-        # Apply proxy if enabled
-        if USE_PROXY and PROXY_URL:
-            try:
-                cl.set_proxy(PROXY_URL)
-                print(f"✅ Verifying with proxy: {PROXY_URL}")
-            except Exception as e:
-                print(f"⚠️ Proxy setup failed: {e}")
-        
-        # Set timeout
-        cl.set_timeout(30)
-        
-        print(f"🔄 Verifying session: {session_id[:15]}...")
-        
-        try:
-            cl.login_by_sessionid(session_id)
-        except Exception as login_err:
-            print(f"Login attempt failed: {login_err}")
-            # Try without proxy if it failed with proxy
-            if USE_PROXY and PROXY_URL:
-                print("🔄 Retrying verification without proxy...")
-                cl = Client()
-                cl.set_timeout(30)
-                cl.login_by_sessionid(session_id)
-        
+        cl.set_device(DEVICE_SETTINGS)
+        cl.set_user_agent(HEADERS["User-Agent"])
+        cl.login_by_sessionid(session_id)
         user_info = cl.account_info()
-        
         if user_info and user_info.pk:
-            print(f"✅ Session valid! User: {user_info.username}")
             return True, user_info.username
-        
-        print("❌ Session invalid: No user info")
-        return False, None
-        
-    except instagrapi.exceptions.LoginRequired as e:
-        print(f"❌ Login required error: {e}")
-        return False, None
-    except instagrapi.exceptions.PleaseWaitFewMinutes as e:
-        print(f"⏳ Rate limited: {e}")
-        return False, None
-    except instagrapi.exceptions.ChallengeRequired as e:
-        print(f"🔒 Challenge required: {e}")
-        print("💡 You need to complete a challenge in the browser first")
-        return False, None
-    except instagrapi.exceptions.ClientLoginError as e:
-        print(f"❌ Login error: {e}")
         return False, None
     except Exception as e:
-        print(f"❌ Verification error: {e}")
+        print(f"Session verification failed: {e}")
         return False, None
 
-# HTML_TEMPLATE - Same as before (keeping it short for the response)
-HTML_TEMPLATE = """
-<!DOCTYPE html>
+# HTML TEMPLATE (same as your original)
+HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -322,10 +202,6 @@ HTML_TEMPLATE = """
         .status-online { background-color: #00ff00; box-shadow: 0 0 10px #00ff00; }
         .status-offline { background-color: #ff0000; box-shadow: 0 0 10px #ff0000; }
         
-        .proxy-status { padding: 10px; margin-bottom: 10px; border-radius: 5px; font-size: 0.9rem; }
-        .proxy-status.success { background: #003300; border: 1px solid #00ff00; color: #00ff00; }
-        .proxy-status.error { background: #330000; border: 1px solid #ff0000; color: #ff0000; }
-        
         @media (max-width: 1200px) { .container { flex-direction: column; } .glowing-text { font-size: 2.5rem; } }
     </style>
 </head>
@@ -349,9 +225,6 @@ HTML_TEMPLATE = """
     <div class="container">
         <div class="left-panel">
             <h2 class="panel-title">CONTROL PANEL</h2>
-            <div id="proxyStatus" class="proxy-status error">
-                ⚠️ PROXY STATUS: DISABLED/DOWN - Running without proxy
-            </div>
             <div class="form-group">
                 <div class="input-group">
                     <label for="sessionId">SESSION ID</label>
@@ -561,17 +434,6 @@ HTML_TEMPLATE = """
             }
         });
 
-        socket.on('proxy_status', function(data) {
-            const statusDiv = document.getElementById('proxyStatus');
-            if (data.working) {
-                statusDiv.className = 'proxy-status success';
-                statusDiv.textContent = '✅ PROXY STATUS: WORKING - ' + data.proxy;
-            } else {
-                statusDiv.className = 'proxy-status error';
-                statusDiv.textContent = '⚠️ PROXY STATUS: DISABLED/DOWN - Running without proxy';
-            }
-        });
-
         function addConsoleMessage(message, type = 'info', scroll = true) {
             const consoleDiv = document.getElementById('console');
             const messageDiv = document.createElement('div');
@@ -634,18 +496,15 @@ page_data = {}
 @socketio.on('connect')
 def handle_connect():
     print("Client connected")
-    # Send proxy status
-    emit('proxy_status', {
-        'working': USE_PROXY and PROXY_URL is not None,
-        'proxy': PROXY_URL if PROXY_URL else 'None'
-    })
 
 @socketio.on('register_page')
 def handle_register_page(data):
     user_key = data.get('user_key')
     page_id = data.get('page_id')
+    
     if not user_key or not page_id:
         return
+    
     page_key = f"{user_key}_{page_id}"
     
     if page_key not in page_data:
@@ -662,6 +521,7 @@ def handle_register_page(data):
         }
     
     join_room(page_key)
+    print(f"Page registered: {page_key}")
     
     conn = get_db_connection()
     user_data = conn.execute('SELECT * FROM user_raids WHERE user_key = ?', (page_key,)).fetchone()
@@ -725,8 +585,10 @@ def handle_unregister_page(data):
     user_key = data.get('user_key')
     page_id = data.get('page_id')
     page_key = f"{user_key}_{page_id}"
+    
     if page_key in page_data:
         del page_data[page_key]
+    
     if page_key in active_clients:
         del active_clients[page_key]
 
@@ -744,19 +606,19 @@ def handle_login(data):
         return
     
     try:
-        # Try login with session
         is_valid, username = verify_session(session_id)
         
         if not is_valid:
-            msg = "❌ Session ID is invalid or expired.\n\n💡 TIPS:\n1. Get a fresh session ID from your browser\n2. Make sure you have a working proxy\n3. Try logging in through browser first"
+            msg = "Session ID is invalid or expired. Please get a new session ID."
             save_log(page_key, msg, 'error')
             emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
             emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
             return
         
         cl, user_info = get_instagram_client(page_key, session_id)
+        
         if not cl or not user_info:
-            msg = "❌ Failed to create Instagram client.\n\n💡 TIPS:\n1. Try a different proxy\n2. Check if Instagram is blocking your IP\n3. Try using a VPN"
+            msg = "Failed to create Instagram client. Please try again."
             save_log(page_key, msg, 'error')
             emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
             emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
@@ -776,13 +638,13 @@ def handle_login(data):
         conn.commit()
         conn.close()
         
-        msg = f"✅ LOGIN SUCCESS: {user_info.username}"
+        msg = f"LOGIN SUCCESS: {user_info.username}"
         save_log(page_key, msg, 'success')
         emit('login_status', {'success': True, 'username': user_info.username, 'page_id': page_id, 'user_key': user_key}, room=page_key)
         emit('console_message', {'message': msg, 'type': 'success', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
         
     except Exception as e:
-        msg = f"❌ LOGIN FAILED: {str(e)}"
+        msg = f"LOGIN FAILED: {str(e)}"
         save_log(page_key, msg, 'error')
         emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
         emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
@@ -796,7 +658,7 @@ def handle_logout(data):
     if page_key in active_clients:
         del active_clients[page_key]
     
-    session_file = f"session_{page_key}.json"
+    session_file = f"/tmp/session_{page_key}.json"
     if os.path.exists(session_file):
         try:
             os.remove(session_file)
@@ -829,14 +691,14 @@ def handle_start_raid(data):
     
     if not user_data or not user_data['session_id']:
         conn.close()
-        msg = "❌ Please login first."
+        msg = "[ERROR] Please login first."
         save_log(page_key, msg, 'error')
         emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
         return
 
     if user_data['is_active']:
         conn.close()
-        msg = "⚠️ Raid is already running."
+        msg = "[ERROR] A raid is already running for this page."
         save_log(page_key, msg, 'warning')
         emit('console_message', {'message': msg, 'type': 'warning', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
         return
@@ -852,7 +714,7 @@ def handle_start_raid(data):
         page_data[page_key]['message'] = message_text
         page_data[page_key]['is_active'] = True
 
-    msg = f"🚀 Starting raid on thread: {thread_id}"
+    msg = f"Starting raid on thread: {thread_id}"
     save_log(page_key, msg, 'warning')
     emit('console_message', {'message': msg, 'type': 'warning', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
     emit('update_stats', {'raid_status': 'RUNNING', 'page_id': page_id, 'user_key': user_key}, room=page_key)
@@ -860,7 +722,9 @@ def handle_start_raid(data):
     threading.Thread(target=run_raid, args=(page_key, thread_id, message_text, page_id, user_key)).start()
 
 def run_raid(page_key, target_thread, target_msg, page_id, user_key):
+    delay_index = 0
     counter = 0
+    
     while True:
         conn = get_db_connection()
         status_row = conn.execute('SELECT is_active, session_id, sent_count, failed_count FROM user_raids WHERE user_key = ?', (page_key,)).fetchone()
@@ -876,12 +740,12 @@ def run_raid(page_key, target_thread, target_msg, page_id, user_key):
                 if cl and user_info:
                     active_clients[page_key] = cl
                 else:
-                    raise Exception("Restore failed")
+                    raise Exception("Failed to restore session")
             except Exception as ex:
                 conn.execute('UPDATE user_raids SET failed_count = failed_count + 1 WHERE user_key = ?', (page_key,))
                 conn.commit()
                 conn.close()
-                err_msg = f"❌ Session restore failed: {str(ex)}"
+                err_msg = f"ERROR: Session restoration failed: {str(ex)}"
                 save_log(page_key, err_msg, 'error')
                 socketio.emit('console_message', {'message': err_msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
                 time.sleep(10)
@@ -894,7 +758,7 @@ def run_raid(page_key, target_thread, target_msg, page_id, user_key):
             conn.commit()
             
             updated_sent = status_row['sent_count'] + 1
-            out_msg = f"✅ Sent #{counter} -> {target_msg[:30]}..."
+            out_msg = f"Sent #{counter} → {target_msg}"
             save_log(page_key, out_msg, 'success')
             
             socketio.emit('console_message', {'message': out_msg, 'type': 'success', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
@@ -904,7 +768,7 @@ def run_raid(page_key, target_thread, target_msg, page_id, user_key):
             conn.commit()
             
             updated_failed = status_row['failed_count'] + 1
-            err_msg = f"❌ Failed to send: {str(e)}"
+            err_msg = f"ERROR: Failed to send: {str(e)}"
             save_log(page_key, err_msg, 'error')
             
             socketio.emit('console_message', {'message': err_msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
@@ -913,6 +777,8 @@ def run_raid(page_key, target_thread, target_msg, page_id, user_key):
         conn.close()
 
         current_delay = random.choice(DELAYS)
+        delay_index += 1
+
         for _ in range(int(current_delay)):
             check_conn = get_db_connection()
             check_active = check_conn.execute('SELECT is_active FROM user_raids WHERE user_key = ?', (page_key,)).fetchone()
@@ -938,11 +804,12 @@ def handle_stop_raid(data):
     if page_key in page_data:
         page_data[page_key]['is_active'] = False
     
-    msg = "🛑 Stopping raid..."
+    msg = "Stopping raid..."
     save_log(page_key, msg, 'warning')
     emit('console_message', {'message': msg, 'type': 'warning', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
     emit('update_stats', {'raid_status': 'STOPPED', 'page_id': page_id, 'user_key': user_key}, room=page_key)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
-    socketio.run(app, host='0.0.0.0', port=port, debug=True)
+    print(f"Starting server on 0.0.0.0:{port}")
+    socketio.run(app, host='0.0.0.0', port=port, debug=False)
