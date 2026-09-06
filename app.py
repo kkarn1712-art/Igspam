@@ -66,44 +66,31 @@ def save_log(user_key, message, log_type):
 
 active_clients = {}
 
-# ================= FIXED: WEB SESSION HEADERS =================
-WEB_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': '*/*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'X-IG-App-ID': '936619743392459',
-}
-
-# Instagram device settings - makes it look like real device
-DEVICE_SETTINGS = {
-    "app_version": "330.0.0.34.90",
-    "android_version": 31,
-    "android_release": "12.0",
-    "dpi": "480dpi",
-    "resolution": "1080x2340",
-    "manufacturer": "Samsung",
-    "device": "beyond2q",
-    "model": "SM-G975F",
-    "cpu": "exynos9820"
-}
-
-# ================= FIXED: SESSION LOGIN FUNCTION =================
+# ================= FIXED: PROPER INSTAGRAM SESSION HANDLING =================
 def get_instagram_client(user_key, session_id):
     try:
         cl = Client()
-        cl.headers = WEB_HEADERS
-        cl.set_device(DEVICE_SETTINGS)
-        cl.set_user_agent(WEB_HEADERS["User-Agent"])
         
-        # Handle session ID with user ID format: sessionid|ds_user_id
-        if '|' in session_id:
-            sid, userid = session_id.split('|', 1)
-            cl.login_by_sessionid(sid.strip(), userid=userid.strip())
-        else:
-            cl.login_by_sessionid(session_id.strip())
-            
+        # Set device settings
+        cl.set_device({
+            "app_version": "330.0.0.34.90",
+            "android_version": 31,
+            "android_release": "12.0",
+            "dpi": "480dpi",
+            "resolution": "1080x2340",
+            "manufacturer": "Samsung",
+            "device": "beyond2q",
+            "model": "SM-G975F",
+            "cpu": "exynos9820"
+        })
+        
+        # Set user agent
+        cl.set_user_agent("Instagram 330.0.0.34.90 Android (31/12; 480dpi; 1080x2340; Samsung; SM-G975F; beyond2q; exynos9820; en_US)")
+        
+        # Try to login with session
+        cl.login_by_sessionid(session_id)
+        
         user_info = cl.account_info()
-        
         if user_info and user_info.pk:
             session_file = f"/tmp/session_{user_key}.json"
             cl.dump_settings(session_file)
@@ -116,16 +103,23 @@ def get_instagram_client(user_key, session_id):
 def verify_session(session_id):
     try:
         cl = Client()
-        cl.headers = WEB_HEADERS
-        cl.set_device(DEVICE_SETTINGS)
-        cl.set_user_agent(WEB_HEADERS["User-Agent"])
         
-        if '|' in session_id:
-            sid, userid = session_id.split('|', 1)
-            cl.login_by_sessionid(sid.strip(), userid=userid.strip())
-        else:
-            cl.login_by_sessionid(session_id.strip())
-            
+        cl.set_device({
+            "app_version": "330.0.0.34.90",
+            "android_version": 31,
+            "android_release": "12.0",
+            "dpi": "480dpi",
+            "resolution": "1080x2340",
+            "manufacturer": "Samsung",
+            "device": "beyond2q",
+            "model": "SM-G975F",
+            "cpu": "exynos9820"
+        })
+        
+        cl.set_user_agent("Instagram 330.0.0.34.90 Android (31/12; 480dpi; 1080x2340; Samsung; SM-G975F; beyond2q; exynos9820; en_US)")
+        
+        cl.login_by_sessionid(session_id)
+        
         user_info = cl.account_info()
         if user_info and user_info.pk:
             return True, user_info.username
@@ -134,7 +128,21 @@ def verify_session(session_id):
         print(f"Session verification failed: {e}")
         return False, None
 
-# HTML TEMPLATE (EXACTLY AS YOUR ORIGINAL - UNCHANGED)
+# ================= FIXED: ALTERNATIVE LOGIN METHOD =================
+def login_with_username_password(username, password):
+    """Alternative login using username/password"""
+    try:
+        cl = Client()
+        cl.login(username, password)
+        user_info = cl.account_info()
+        if user_info and user_info.pk:
+            return cl, user_info
+        return None, None
+    except Exception as e:
+        print(f"Username/Password login error: {e}")
+        return None, None
+
+# HTML TEMPLATE (UNCHANGED)
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -609,7 +617,7 @@ def handle_unregister_page(data):
     if page_key in active_clients:
         del active_clients[page_key]
 
-# ================= FIXED: LOGIN HANDLER =================
+# ================= FIXED: LOGIN WITH BETTER SESSION HANDLING =================
 @socketio.on('login')
 def handle_login(data):
     user_key = data.get('user_key')
@@ -624,15 +632,17 @@ def handle_login(data):
         return
     
     try:
+        # Try to verify session
         is_valid, username = verify_session(session_id)
         
         if not is_valid:
-            msg = "Session ID is invalid or expired. Please get a new session ID."
+            msg = "Session ID is invalid or expired. Please get a new session ID from browser cookies."
             save_log(page_key, msg, 'error')
             emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
             emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
             return
         
+        # Create client with session
         cl, user_info = get_instagram_client(page_key, session_id)
         
         if not cl or not user_info:
