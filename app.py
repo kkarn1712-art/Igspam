@@ -9,7 +9,7 @@ from flask import Flask, render_template_string, request, session
 from flask_socketio import SocketIO, emit, join_room
 import instagrapi
 from instagrapi import Client
-from instagrapi.exceptions import LoginRequired
+from instagrapi.exceptions import LoginRequired, PleaseWaitFewMinutes, ChallengeRequired
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret_key_pratik_secure_2026'
@@ -66,30 +66,193 @@ def save_log(user_key, message, log_type):
 
 active_clients = {}
 
-# ================= FIXED: PROPER INSTAGRAM SESSION HANDLING =================
-def get_instagram_client(user_key, session_id):
+# ================= FIXED: PROPER INSTAGRAM SESSION HANDLING WITH MULTIPLE METHODS =================
+def create_instagram_client():
+    """Create a properly configured Instagram client"""
+    cl = Client()
+    
+    # Set device settings
+    cl.set_device({
+        "app_version": "330.0.0.34.90",
+        "android_version": 31,
+        "android_release": "12.0",
+        "dpi": "480dpi",
+        "resolution": "1080x2340",
+        "manufacturer": "Samsung",
+        "device": "beyond2q",
+        "model": "SM-G975F",
+        "cpu": "exynos9820"
+    })
+    
+    # Set user agent
+    cl.set_user_agent("Instagram 330.0.0.34.90 Android (31/12; 480dpi; 1080x2340; Samsung; SM-G975F; beyond2q; exynos9820; en_US)")
+    
+    return cl
+
+def verify_session(session_id):
+    """Verify if session is valid"""
     try:
-        cl = Client()
-        
-        # Set device settings
-        cl.set_device({
-            "app_version": "330.0.0.34.90",
-            "android_version": 31,
-            "android_release": "12.0",
-            "dpi": "480dpi",
-            "resolution": "1080x2340",
-            "manufacturer": "Samsung",
-            "device": "beyond2q",
-            "model": "SM-G975F",
-            "cpu": "exynos9820"
-        })
-        
-        # Set user agent
-        cl.set_user_agent("Instagram 330.0.0.34.90 Android (31/12; 480dpi; 1080x2340; Samsung; SM-G975F; beyond2q; exynos9820; en_US)")
+        cl = create_instagram_client()
+        cl.login_by_sessionid(session_id)
+        user_info = cl.account_info()
+        if user_info and user_info.pk:
+            return True, user_info.username
+        return False, None
+    except ChallengeRequired:
+        print("Challenge required - session may need verification")
+        return False, "Challenge Required"
+    except PleaseWaitFewMinutes:
+        print("Rate limited - please wait")
+        return False, "Rate Limited"
+    except Exception as e:
+        print(f"Session verification failed: {e}")
+        return False, None
+
+def login_with_sessionid(session_id):
+    """Login using session ID with better error handling"""
+    try:
+        cl = create_instagram_client()
         
         # Try to login with session
         cl.login_by_sessionid(session_id)
         
+        # Verify login worked
+        user_info = cl.account_info()
+        if user_info and user_info.pk:
+            return cl, user_info
+        return None, None
+        
+    except ChallengeRequired:
+        print("Challenge required! Session needs verification.")
+        return None, None
+    except PleaseWaitFewMinutes:
+        print("Rate limited! Please wait a few minutes.")
+        return None, None
+    except Exception as e:
+        print(f"Session login error: {e}")
+        return None, None
+
+def login_with_username_password(username, password):
+    """Alternative: Login using username and password"""
+    try:
+        cl = create_instagram_client()
+        cl.login(username, password)
+        user_info = cl.account_info()
+        if user_info and user_info.pk:
+            return cl, user_info
+        return None, None
+    except Exception as e:
+        print(f"Username/password login error: {e}")
+        return None, None
+
+# ================= FIXED: LOGIN HANDLER WITH BETTER SESSION HANDLING =================
+@socketio.on('login')
+def handle_login(data):
+    user_key = data.get('user_key')
+    page_id = data.get('page_id')
+    session_id = data.get('session_id')
+    page_key = f"{user_key}_{page_id}"
+    
+    if not session_id:
+        msg = "Please enter a session ID"
+        save_log(page_key, msg, 'error')
+        emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+        return
+    
+    # Clean session ID - remove extra spaces and newlines
+    session_id = session_id.strip()
+    
+    try:
+        # Try to verify session first
+        is_valid, username = verify_session(session_id)
+        
+        if not is_valid:
+            # If verification fails, try to login anyway - sometimes verification fails but login works
+            cl, user_info = login_with_sessionid(session_id)
+            
+            if not cl or not user_info:
+                msg = """Session ID is invalid or expired. Please try:
+1. Get fresh session ID from browser cookies
+2. Format: sessionid cookie value (starts with numbers and contains %3A)
+3. If using 2FA, you may need to use username/password instead"""
+                save_log(page_key, msg, 'error')
+                emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
+                emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+                return
+            
+            # Login worked even though verification failed
+            active_clients[page_key] = cl
+            
+            if page_key in page_data:
+                page_data[page_key]['session_id'] = session_id
+                page_data[page_key]['username'] = user_info.username
+            
+            conn = get_db_connection()
+            conn.execute('''
+                INSERT INTO user_raids (user_key, session_id, username) VALUES (?, ?, ?)
+                ON CONFLICT(user_key) DO UPDATE SET session_id=?, username=?
+            ''', (page_key, session_id, user_info.username, session_id, user_info.username))
+            conn.commit()
+            conn.close()
+            
+            msg = f"LOGIN SUCCESS: {user_info.username}"
+            save_log(page_key, msg, 'success')
+            emit('login_status', {'success': True, 'username': user_info.username, 'page_id': page_id, 'user_key': user_key}, room=page_key)
+            emit('console_message', {'message': msg, 'type': 'success', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+            return
+        
+        # Verification passed - proceed with login
+        cl, user_info = login_with_sessionid(session_id)
+        
+        if not cl or not user_info:
+            msg = "Failed to create Instagram client. Please try again."
+            save_log(page_key, msg, 'error')
+            emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
+            emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+            return
+        
+        active_clients[page_key] = cl
+        
+        if page_key in page_data:
+            page_data[page_key]['session_id'] = session_id
+            page_data[page_key]['username'] = user_info.username
+        
+        conn = get_db_connection()
+        conn.execute('''
+            INSERT INTO user_raids (user_key, session_id, username) VALUES (?, ?, ?)
+            ON CONFLICT(user_key) DO UPDATE SET session_id=?, username=?
+        ''', (page_key, session_id, user_info.username, session_id, user_info.username))
+        conn.commit()
+        conn.close()
+        
+        msg = f"LOGIN SUCCESS: {user_info.username}"
+        save_log(page_key, msg, 'success')
+        emit('login_status', {'success': True, 'username': user_info.username, 'page_id': page_id, 'user_key': user_key}, room=page_key)
+        emit('console_message', {'message': msg, 'type': 'success', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+        
+    except ChallengeRequired as e:
+        msg = f"Challenge Required! Instagram needs verification. Try using username/password login instead. Error: {str(e)}"
+        save_log(page_key, msg, 'error')
+        emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
+        emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+        
+    except PleaseWaitFewMinutes as e:
+        msg = f"Rate Limited! Please wait 5-10 minutes before trying again. Error: {str(e)}"
+        save_log(page_key, msg, 'error')
+        emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
+        emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+        
+    except Exception as e:
+        msg = f"LOGIN FAILED: {str(e)}"
+        save_log(page_key, msg, 'error')
+        emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
+        emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
+
+def get_instagram_client(user_key, session_id):
+    """Get Instagram client with session restoration"""
+    try:
+        cl = create_instagram_client()
+        cl.login_by_sessionid(session_id)
         user_info = cl.account_info()
         if user_info and user_info.pk:
             session_file = f"/tmp/session_{user_key}.json"
@@ -98,48 +261,6 @@ def get_instagram_client(user_key, session_id):
         return None, None
     except Exception as e:
         print(f"Login error: {e}")
-        return None, None
-
-def verify_session(session_id):
-    try:
-        cl = Client()
-        
-        cl.set_device({
-            "app_version": "330.0.0.34.90",
-            "android_version": 31,
-            "android_release": "12.0",
-            "dpi": "480dpi",
-            "resolution": "1080x2340",
-            "manufacturer": "Samsung",
-            "device": "beyond2q",
-            "model": "SM-G975F",
-            "cpu": "exynos9820"
-        })
-        
-        cl.set_user_agent("Instagram 330.0.0.34.90 Android (31/12; 480dpi; 1080x2340; Samsung; SM-G975F; beyond2q; exynos9820; en_US)")
-        
-        cl.login_by_sessionid(session_id)
-        
-        user_info = cl.account_info()
-        if user_info and user_info.pk:
-            return True, user_info.username
-        return False, None
-    except Exception as e:
-        print(f"Session verification failed: {e}")
-        return False, None
-
-# ================= FIXED: ALTERNATIVE LOGIN METHOD =================
-def login_with_username_password(username, password):
-    """Alternative login using username/password"""
-    try:
-        cl = Client()
-        cl.login(username, password)
-        user_info = cl.account_info()
-        if user_info and user_info.pk:
-            return cl, user_info
-        return None, None
-    except Exception as e:
-        print(f"Username/Password login error: {e}")
         return None, None
 
 # HTML TEMPLATE (UNCHANGED)
@@ -616,66 +737,6 @@ def handle_unregister_page(data):
     
     if page_key in active_clients:
         del active_clients[page_key]
-
-# ================= FIXED: LOGIN WITH BETTER SESSION HANDLING =================
-@socketio.on('login')
-def handle_login(data):
-    user_key = data.get('user_key')
-    page_id = data.get('page_id')
-    session_id = data.get('session_id')
-    page_key = f"{user_key}_{page_id}"
-    
-    if not session_id:
-        msg = "Please enter a session ID"
-        save_log(page_key, msg, 'error')
-        emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
-        return
-    
-    try:
-        # Try to verify session
-        is_valid, username = verify_session(session_id)
-        
-        if not is_valid:
-            msg = "Session ID is invalid or expired. Please get a new session ID from browser cookies."
-            save_log(page_key, msg, 'error')
-            emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
-            emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
-            return
-        
-        # Create client with session
-        cl, user_info = get_instagram_client(page_key, session_id)
-        
-        if not cl or not user_info:
-            msg = "Failed to create Instagram client. Please try again."
-            save_log(page_key, msg, 'error')
-            emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
-            emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
-            return
-        
-        active_clients[page_key] = cl
-        
-        if page_key in page_data:
-            page_data[page_key]['session_id'] = session_id
-            page_data[page_key]['username'] = user_info.username
-        
-        conn = get_db_connection()
-        conn.execute('''
-            INSERT INTO user_raids (user_key, session_id, username) VALUES (?, ?, ?)
-            ON CONFLICT(user_key) DO UPDATE SET session_id=?, username=?
-        ''', (page_key, session_id, user_info.username, session_id, user_info.username))
-        conn.commit()
-        conn.close()
-        
-        msg = f"LOGIN SUCCESS: {user_info.username}"
-        save_log(page_key, msg, 'success')
-        emit('login_status', {'success': True, 'username': user_info.username, 'page_id': page_id, 'user_key': user_key}, room=page_key)
-        emit('console_message', {'message': msg, 'type': 'success', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
-        
-    except Exception as e:
-        msg = f"LOGIN FAILED: {str(e)}"
-        save_log(page_key, msg, 'error')
-        emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
-        emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
 
 @socketio.on('logout')
 def handle_logout(data):
