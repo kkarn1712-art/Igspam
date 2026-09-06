@@ -17,6 +17,19 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 DB_FILE = '/tmp/raid_console_data.db'
 DELAYS = [24, 45, 20, 15, 40]
 
+# ================= PROXY CONFIGURATION =================
+PROXY_LIST = [
+    # Add your proxies here in format: "http://user:pass@ip:port"
+    # "http://username:password@proxy_ip:port",
+    # "socks5://username:password@proxy_ip:port",
+]
+
+def get_proxy():
+    """Get a random proxy from the list"""
+    if PROXY_LIST:
+        return {'http': random.choice(PROXY_LIST), 'https': random.choice(PROXY_LIST)}
+    return None
+
 # --- DATABASE SETUP ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -42,6 +55,15 @@ def init_db():
             timestamp TEXT
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS proxy_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proxy TEXT,
+            success_count INTEGER DEFAULT 0,
+            fail_count INTEGER DEFAULT 0,
+            last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -59,6 +81,22 @@ def save_log(user_key, message, log_type):
         'INSERT INTO console_logs (user_key, log_message, log_type, timestamp) VALUES (?, ?, ?, ?)',
         (user_key, message, log_type, timestamp)
     )
+    conn.commit()
+    conn.close()
+
+def log_proxy_stats(proxy, success=True):
+    """Log proxy usage statistics"""
+    conn = get_db_connection()
+    if success:
+        conn.execute(
+            'UPDATE proxy_stats SET success_count = success_count + 1, last_used = CURRENT_TIMESTAMP WHERE proxy = ?',
+            (proxy,)
+        )
+    else:
+        conn.execute(
+            'UPDATE proxy_stats SET fail_count = fail_count + 1, last_used = CURRENT_TIMESTAMP WHERE proxy = ?',
+            (proxy,)
+        )
     conn.commit()
     conn.close()
 
@@ -83,8 +121,8 @@ def get_headers():
         'Content-Type': 'application/x-www-form-urlencoded',
     }
 
-def create_session(session_id):
-    """Create a requests session with Instagram cookies"""
+def create_session(session_id, use_proxy=True):
+    """Create a requests session with Instagram cookies and optional proxy"""
     sess = requests.Session()
     
     # Clean session ID - remove ds_user_id if present
@@ -94,62 +132,87 @@ def create_session(session_id):
     # Set cookies
     sess.cookies.set('sessionid', session_id, domain='.instagram.com', path='/')
     sess.cookies.set('ig_did', str(uuid.uuid4()), domain='.instagram.com', path='/')
+    sess.cookies.set('csrftoken', str(uuid.uuid4()).replace('-', ''), domain='.instagram.com', path='/')
     
     # Set headers
     sess.headers.update(get_headers())
     
+    # Set proxy if available and enabled
+    if use_proxy:
+        proxy = get_proxy()
+        if proxy:
+            sess.proxies.update(proxy)
+            print(f"Using proxy: {proxy['http']}")
+    
     return sess
 
-def verify_session_with_requests(session_id):
-    """Verify session using direct HTTP requests"""
+def verify_session_with_requests(session_id, use_proxy=True):
+    """Verify session using direct HTTP requests with optional proxy"""
     try:
-        sess = create_session(session_id)
+        sess = create_session(session_id, use_proxy)
         
         # Try to get user info from edit profile endpoint
-        response = sess.get('https://www.instagram.com/api/v1/accounts/edit/web/')
+        response = sess.get('https://www.instagram.com/api/v1/accounts/edit/web/', timeout=30)
         
         if response.status_code == 200:
             data = response.json()
             if data.get('form_data'):
                 username = data.get('form_data', {}).get('username', 'user')
+                # Log success
+                if sess.proxies:
+                    log_proxy_stats(sess.proxies.get('http', ''), True)
                 return True, username
         
         # Alternative: try to get own profile
         response = sess.get('https://www.instagram.com/api/v1/users/web_profile_info/',
-                           params={'username': 'instagram'})
+                           params={'username': 'instagram'}, timeout=30)
         
         if response.status_code == 200:
             data = response.json()
             if data.get('data', {}).get('user'):
+                if sess.proxies:
+                    log_proxy_stats(sess.proxies.get('http', ''), True)
                 return True, 'verified_user'
+        
+        # Log failure
+        if sess.proxies:
+            log_proxy_stats(sess.proxies.get('http', ''), False)
         
         return False, None
     except Exception as e:
         print(f"Session verification error: {e}")
         return False, None
 
-def login_with_requests(session_id):
-    """Login using requests only - no instagrapi"""
+def login_with_requests(session_id, use_proxy=True):
+    """Login using requests only with optional proxy"""
     try:
-        sess = create_session(session_id)
+        sess = create_session(session_id, use_proxy)
         
         # Get user info
-        response = sess.get('https://www.instagram.com/api/v1/accounts/edit/web/')
+        response = sess.get('https://www.instagram.com/api/v1/accounts/edit/web/', timeout=30)
         
         if response.status_code == 200:
             data = response.json()
             if data.get('form_data'):
                 username = data.get('form_data', {}).get('username', 'user')
+                if sess.proxies:
+                    log_proxy_stats(sess.proxies.get('http', ''), True)
                 return sess, username
         
         # Alternative endpoint
         response = sess.get('https://www.instagram.com/api/v1/users/web_profile_info/',
-                           params={'username': 'instagram'})
+                           params={'username': 'instagram'}, timeout=30)
         
         if response.status_code == 200:
             data = response.json()
             if data.get('data', {}).get('user'):
+                if sess.proxies:
+                    log_proxy_stats(sess.proxies.get('http', ''), True)
                 return sess, 'user'
+        
+        # Log failure
+        if sess.proxies:
+            log_proxy_stats(sess.proxies.get('http', ''), False)
         
         return None, None
     except Exception as e:
@@ -157,7 +220,7 @@ def login_with_requests(session_id):
         return None, None
 
 def send_message_via_requests(sess, thread_id, message):
-    """Send a message using requests session"""
+    """Send a message using requests session with proxy support"""
     try:
         url = f"https://www.instagram.com/api/v1/direct_v2/threads/{thread_id}/send_message/"
         
@@ -166,16 +229,25 @@ def send_message_via_requests(sess, thread_id, message):
             "thread_id": thread_id,
         }
         
-        response = sess.post(url, data=data)
+        response = sess.post(url, data=data, timeout=30)
         
         if response.status_code == 200:
+            # Log proxy success
+            if sess.proxies:
+                log_proxy_stats(sess.proxies.get('http', ''), True)
             return True
         elif response.status_code == 400:
             # Try alternative endpoint
             url = f"https://www.instagram.com/api/v1/direct_v2/threads/{thread_id}/send_message/"
-            response = sess.post(url, data=data)
+            response = sess.post(url, data=data, timeout=30)
             if response.status_code == 200:
+                if sess.proxies:
+                    log_proxy_stats(sess.proxies.get('http', ''), True)
                 return True
+        
+        # Log failure
+        if sess.proxies:
+            log_proxy_stats(sess.proxies.get('http', ''), False)
         
         return False
     except Exception as e:
@@ -673,8 +745,8 @@ def handle_login(data):
     session_id = session_id.strip()
     
     try:
-        # Try to login with requests
-        sess, username = login_with_requests(session_id)
+        # Try to login with requests (with proxy)
+        sess, username = login_with_requests(session_id, use_proxy=True)
         
         if sess and username:
             active_clients[page_key] = sess
@@ -691,7 +763,8 @@ def handle_login(data):
             conn.commit()
             conn.close()
             
-            msg = f"LOGIN SUCCESS: {username}"
+            proxy_info = "with proxy" if sess.proxies else "without proxy"
+            msg = f"LOGIN SUCCESS: {username} ({proxy_info})"
             save_log(page_key, msg, 'success')
             emit('login_status', {'success': True, 'username': username, 'page_id': page_id, 'user_key': user_key}, room=page_key)
             emit('console_message', {'message': msg, 'type': 'success', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
@@ -702,7 +775,8 @@ def handle_login(data):
 1. Get fresh session ID from browser cookies
 2. Format: sessionid cookie value (starts with numbers and contains %3A)
 3. Make sure you are logged into Instagram in your browser
-4. Try clearing browser cookies and logging in again"""
+4. Try clearing browser cookies and logging in again
+5. Check if your proxies are working"""
         save_log(page_key, msg, 'error')
         emit('login_status', {'success': False, 'page_id': page_id, 'user_key': user_key}, room=page_key)
         emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
@@ -793,7 +867,7 @@ def run_raid(page_key, target_thread, target_msg, page_id, user_key):
         sess = active_clients.get(page_key)
         if not sess:
             try:
-                sess, username = login_with_requests(status_row['session_id'])
+                sess, username = login_with_requests(status_row['session_id'], use_proxy=True)
                 if sess and username:
                     active_clients[page_key] = sess
                 else:
