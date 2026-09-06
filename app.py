@@ -9,7 +9,7 @@ from flask import Flask, render_template_string, request, session
 from flask_socketio import SocketIO, emit, join_room
 import instagrapi
 from instagrapi import Client
-from instagrapi.exceptions import LoginRequired, PleaseWaitFewMinutes, ChallengeRequired
+from instagrapi.exceptions import LoginRequired, PleaseWaitFewMinutes, ChallengeRequired, ClientError
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret_key_pratik_secure_2026'
@@ -66,7 +66,7 @@ def save_log(user_key, message, log_type):
 
 active_clients = {}
 
-# ================= FIXED: PROPER INSTAGRAM SESSION HANDLING WITH MULTIPLE METHODS =================
+# ================= FIXED: PROPER INSTAGRAM SESSION HANDLING =================
 def create_instagram_client():
     """Create a properly configured Instagram client"""
     cl = Client()
@@ -81,7 +81,8 @@ def create_instagram_client():
         "manufacturer": "Samsung",
         "device": "beyond2q",
         "model": "SM-G975F",
-        "cpu": "exynos9820"
+        "cpu": "exynos9820",
+        "version_code": "330.0.0.34.90"  # Added missing version_code
     })
     
     # Set user agent
@@ -104,6 +105,9 @@ def verify_session(session_id):
     except PleaseWaitFewMinutes:
         print("Rate limited - please wait")
         return False, "Rate Limited"
+    except ClientError as e:
+        print(f"Client error: {e}")
+        return False, str(e)
     except Exception as e:
         print(f"Session verification failed: {e}")
         return False, None
@@ -128,6 +132,9 @@ def login_with_sessionid(session_id):
     except PleaseWaitFewMinutes:
         print("Rate limited! Please wait a few minutes.")
         return None, None
+    except ClientError as e:
+        print(f"Client error: {e}")
+        return None, None
     except Exception as e:
         print(f"Session login error: {e}")
         return None, None
@@ -145,7 +152,7 @@ def login_with_username_password(username, password):
         print(f"Username/password login error: {e}")
         return None, None
 
-# ================= FIXED: LOGIN HANDLER WITH BETTER SESSION HANDLING =================
+# ================= FIXED: LOGIN HANDLER WITH BETTER ERROR HANDLING =================
 @socketio.on('login')
 def handle_login(data):
     user_key = data.get('user_key')
@@ -167,7 +174,7 @@ def handle_login(data):
         is_valid, username = verify_session(session_id)
         
         if not is_valid:
-            # If verification fails, try to login anyway - sometimes verification fails but login works
+            # If verification fails, try to login anyway
             cl, user_info = login_with_sessionid(session_id)
             
             if not cl or not user_info:
@@ -180,7 +187,7 @@ def handle_login(data):
                 emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
                 return
             
-            # Login worked even though verification failed
+            # Login worked
             active_clients[page_key] = cl
             
             if page_key in page_data:
@@ -263,7 +270,7 @@ def get_instagram_client(user_key, session_id):
         print(f"Login error: {e}")
         return None, None
 
-# HTML TEMPLATE (UNCHANGED)
+# ================= HTML TEMPLATE (UNCHANGED) =================
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
