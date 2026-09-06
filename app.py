@@ -15,7 +15,7 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret_key_pratik_secure_2026'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
-# Use /tmp for Railway/Render (writable directory)
+# Use /tmp for Railway (writable directory)
 DB_FILE = '/tmp/raid_console_data.db'
 DELAYS = [24, 45, 20, 15, 40]
 
@@ -74,7 +74,7 @@ WEB_HEADERS = {
     'X-IG-App-ID': '936619743392459',
 }
 
-# Instagram device settings
+# Instagram device settings - makes it look like real device
 DEVICE_SETTINGS = {
     "app_version": "330.0.0.34.90",
     "android_version": 31,
@@ -100,10 +100,10 @@ def get_instagram_client(user_key, session_id):
             sid, userid = session_id.split('|', 1)
             cl.login_by_sessionid(sid.strip(), userid=userid.strip())
         else:
-            # Try regular session login
             cl.login_by_sessionid(session_id.strip())
             
         user_info = cl.account_info()
+        
         if user_info and user_info.pk:
             session_file = f"/tmp/session_{user_key}.json"
             cl.dump_settings(session_file)
@@ -113,7 +113,6 @@ def get_instagram_client(user_key, session_id):
         print(f"Login error: {e}")
         return None, None
 
-# ================= FIXED: SESSION VERIFICATION =================
 def verify_session(session_id):
     try:
         cl = Client()
@@ -121,7 +120,6 @@ def verify_session(session_id):
         cl.set_device(DEVICE_SETTINGS)
         cl.set_user_agent(WEB_HEADERS["User-Agent"])
         
-        # Handle session ID with user ID format
         if '|' in session_id:
             sid, userid = session_id.split('|', 1)
             cl.login_by_sessionid(sid.strip(), userid=userid.strip())
@@ -136,7 +134,7 @@ def verify_session(session_id):
         print(f"Session verification failed: {e}")
         return False, None
 
-# ================= HTML TEMPLATE (UNCHANGED) =================
+# HTML TEMPLATE (EXACTLY AS YOUR ORIGINAL - UNCHANGED)
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -246,8 +244,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <h2 class="panel-title">CONTROL PANEL</h2>
             <div class="form-group">
                 <div class="input-group">
-                    <label for="sessionId">SESSION ID (or SESSIONID|DS_USER_ID)</label>
-                    <input type="text" id="sessionId" placeholder="Enter Instagram Session ID or SESSIONID|DS_USER_ID">
+                    <label for="sessionId">SESSION ID</label>
+                    <input type="text" id="sessionId" placeholder="Enter Instagram Session ID">
                 </div>
                 <div class="button-group">
                     <button class="btn btn-login" onclick="login()">LOGIN</button>
@@ -626,7 +624,6 @@ def handle_login(data):
         return
     
     try:
-        # Verify session first
         is_valid, username = verify_session(session_id)
         
         if not is_valid:
@@ -636,7 +633,6 @@ def handle_login(data):
             emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
             return
         
-        # Create client with session
         cl, user_info = get_instagram_client(page_key, session_id)
         
         if not cl or not user_info:
