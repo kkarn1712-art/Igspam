@@ -15,7 +15,7 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret_key_pratik_secure_2026'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
-# Use /tmp for Railway (writable directory)
+# Use /tmp for Railway/Render (writable directory)
 DB_FILE = '/tmp/raid_console_data.db'
 DELAYS = [24, 45, 20, 15, 40]
 
@@ -66,7 +66,15 @@ def save_log(user_key, message, log_type):
 
 active_clients = {}
 
-# Instagram device settings - makes it look like real device
+# ================= FIXED: WEB SESSION HEADERS =================
+WEB_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'X-IG-App-ID': '936619743392459',
+}
+
+# Instagram device settings
 DEVICE_SETTINGS = {
     "app_version": "330.0.0.34.90",
     "android_version": 31,
@@ -79,21 +87,23 @@ DEVICE_SETTINGS = {
     "cpu": "exynos9820"
 }
 
-HEADERS = {
-    "User-Agent": "Instagram 330.0.0.34.90 Android (31/12; 480dpi; 1080x2340; Samsung; SM-G975F; beyond2q; exynos9820; en_US)",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
-    "Connection": "close",
-}
-
+# ================= FIXED: SESSION LOGIN FUNCTION =================
 def get_instagram_client(user_key, session_id):
     try:
         cl = Client()
+        cl.headers = WEB_HEADERS
         cl.set_device(DEVICE_SETTINGS)
-        cl.set_user_agent(HEADERS["User-Agent"])
-        cl.login_by_sessionid(session_id)
-        user_info = cl.account_info()
+        cl.set_user_agent(WEB_HEADERS["User-Agent"])
         
+        # Handle session ID with user ID format: sessionid|ds_user_id
+        if '|' in session_id:
+            sid, userid = session_id.split('|', 1)
+            cl.login_by_sessionid(sid.strip(), userid=userid.strip())
+        else:
+            # Try regular session login
+            cl.login_by_sessionid(session_id.strip())
+            
+        user_info = cl.account_info()
         if user_info and user_info.pk:
             session_file = f"/tmp/session_{user_key}.json"
             cl.dump_settings(session_file)
@@ -103,12 +113,21 @@ def get_instagram_client(user_key, session_id):
         print(f"Login error: {e}")
         return None, None
 
+# ================= FIXED: SESSION VERIFICATION =================
 def verify_session(session_id):
     try:
         cl = Client()
+        cl.headers = WEB_HEADERS
         cl.set_device(DEVICE_SETTINGS)
-        cl.set_user_agent(HEADERS["User-Agent"])
-        cl.login_by_sessionid(session_id)
+        cl.set_user_agent(WEB_HEADERS["User-Agent"])
+        
+        # Handle session ID with user ID format
+        if '|' in session_id:
+            sid, userid = session_id.split('|', 1)
+            cl.login_by_sessionid(sid.strip(), userid=userid.strip())
+        else:
+            cl.login_by_sessionid(session_id.strip())
+            
         user_info = cl.account_info()
         if user_info and user_info.pk:
             return True, user_info.username
@@ -117,7 +136,7 @@ def verify_session(session_id):
         print(f"Session verification failed: {e}")
         return False, None
 
-# HTML TEMPLATE (same as your original)
+# ================= HTML TEMPLATE (UNCHANGED) =================
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -227,8 +246,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <h2 class="panel-title">CONTROL PANEL</h2>
             <div class="form-group">
                 <div class="input-group">
-                    <label for="sessionId">SESSION ID</label>
-                    <input type="text" id="sessionId" placeholder="Enter Instagram Session ID">
+                    <label for="sessionId">SESSION ID (or SESSIONID|DS_USER_ID)</label>
+                    <input type="text" id="sessionId" placeholder="Enter Instagram Session ID or SESSIONID|DS_USER_ID">
                 </div>
                 <div class="button-group">
                     <button class="btn btn-login" onclick="login()">LOGIN</button>
@@ -592,6 +611,7 @@ def handle_unregister_page(data):
     if page_key in active_clients:
         del active_clients[page_key]
 
+# ================= FIXED: LOGIN HANDLER =================
 @socketio.on('login')
 def handle_login(data):
     user_key = data.get('user_key')
@@ -606,6 +626,7 @@ def handle_login(data):
         return
     
     try:
+        # Verify session first
         is_valid, username = verify_session(session_id)
         
         if not is_valid:
@@ -615,6 +636,7 @@ def handle_login(data):
             emit('console_message', {'message': msg, 'type': 'error', 'timestamp': time.strftime('%H:%M:%S'), 'page_id': page_id, 'user_key': user_key}, room=page_key)
             return
         
+        # Create client with session
         cl, user_info = get_instagram_client(page_key, session_id)
         
         if not cl or not user_info:
